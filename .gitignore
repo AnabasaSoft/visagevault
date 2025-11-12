@@ -1,0 +1,46 @@
+# ====================================
+# PYTHON ENVIRONMENT & CACHE
+# ====================================
+# Entorno Virtual (¡CRUCIAL!)
+venv/
+.venv/
+env/
+# Archivos de caché
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+
+# Paquetes de instalación/distribución
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# ====================================
+# VISAGEVAULT ESPECÍFICO & LOGS
+# ====================================
+# Base de datos SQLite (se genera localmente)
+visagevault.db
+*.db
+*.sqlite3
+
+# Archivo de configuración (local del usuario)
+visagevault_config.json
+
+# Cache de miniaturas y otros datos temporales (generados por thumbnail_generator.py)
+.visagevault_cache/
+
+# ====================================
+# IDE / EDITOR / OS FILES
+# ====================================
+# macOS / Linux
+.DS_Store
+.Trashes
+.localized
+
+# Python IDEs (PyCharm / VS Code)
+.idea/
+.vscode/
+# Historial de VS Code
+.history/
