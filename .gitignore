@@ -24,6 +24,7 @@ dist/
 visagevault.db
 *.db
 *.sqlite3
+actualiza.sh
 
 # Archivo de configuración (local del usuario)
 visagevault_config.json
