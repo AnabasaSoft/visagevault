@@ -9,23 +9,32 @@
 # GitHub: github.com/danitxu79
 # Portafolio: https://danitxu79.github.io/
 #
-# --- LICENCIA Y DERECHOS DE USO ---
+# ## 📜 Licencia
 #
-# Este software está disponible bajo un doble modelo de licencia:
+# Este proyecto se ofrece bajo un modelo de Doble Licencia (Dual License), brindando máxima flexibilidad:
 #
-# 1. USO NO COMERCIAL (Licencia Pública):
-#    El código base está licenciado bajo la **GNU Lesser General Public License v3 (LGPLv3)**.
-#    Esto permite el uso, estudio, modificación y distribución para fines personales,
-#    educativos y no comerciales. Las modificaciones al código principal deben
-#    mantenerse abiertas bajo LGPLv3.
+# 1. Licencia Pública (LGPLv3)
 #
-# 2. USO COMERCIAL (Licencia Propietaria):
-#    Para cualquier uso comercial, lucrativo o que requiera evitar las restricciones
-#    de copyleft de la LGPLv3, es OBLIGATORIO adquirir una **Licencia Comercial
-#    Propietaria**.
+# Este software está disponible bajo la GNU Lesser General Public License v3.0 (LGPLv3).
+# Puedes usarlo libremente de acuerdo con los términos de la LGPLv3, lo cual es ideal para proyectos de código abierto. En resumen, esto significa que si usas esta biblioteca
+# (especialmente si la modificas), debes cumplir con las obligaciones de la LGPLv3, como publicar el código fuente de tus modificaciones a esta biblioteca y permitir que los usuarios
+# la reemplacen.
+# Puedes encontrar el texto completo de la licencia en el archivo LICENSE de este repositorio.
 #
-#    Para adquirir una licencia comercial, por favor contacte al autor en:
-#    dani.eus79@gmail.com
+# 2. Licencia Comercial (Privativa)
+#
+# Si los términos de la LGPLv3 no se ajustan a tus necesidades, ofrezco una licencia comercial alternativa.
+# Necesitarás una licencia comercial si, por ejemplo:
+#
+#    Deseas incluir el código en un software propietario (código cerrado) sin tener que publicar tus modificaciones.
+#    Necesitas enlazar estáticamente (static linking) la biblioteca con tu aplicación propietaria.
+#    Prefieres no estar sujeto a las obligaciones y restricciones de la LGPLv3.
+#
+# La licencia comercial te otorga el derecho a usar el código en tus aplicaciones comerciales de código cerrado sin las restricciones de la LGPLv3, a cambio de una tarifa.
+# Para adquirir una licencia comercial o para más información, por favor, pónte en contacto conmigo en:
+#
+# dani.eus79@gmail.com
+#
 #
 # ==============================================================================
 
