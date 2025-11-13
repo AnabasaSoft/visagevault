@@ -1,109 +1,88 @@
-# 📸 VisageVault - Gestor de Fotografías Inteligente
 
-## Visión General
+# VisageVault - Gestor de Fotografías Inteligente
 
-**VisageVault** es un gestor de colecciones fotográficas avanzado, diseñado para el entorno Linux (y portable a Windows/macOS), que utiliza la inteligencia artificial para automatizar la organización, la búsqueda y la gestión de metadatos.
+DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 
-En esta fase de desarrollo (v0.1), la aplicación se centra en la estabilidad, la gestión de archivos en colecciones masivas y la edición persistente de metadatos de tiempo.
+VisageVault es una aplicación de escritorio moderna y de alto rendimiento para gestionar grandes colecciones de fotografías. Se centra en una navegación ultrarrápida basada en la fecha de tus fotos, utilizando escaneo asíncrono, una base de datos local y generación de miniaturas en hilos para una experiencia de usuario fluida.
 
----
+-----
 
-🚀 Funcionalidades Clave de VisageVault (v0.1 Pre-Release)
+## 🚀 Características Principales
 
-La aplicación ya no es solo un prototipo, sino una herramienta funcional con gestión avanzada de datos.
+  * **Navegación por Fechas:** Organiza y agrupa automáticamente toda tu biblioteca por **Año** y **Mes**, permitiéndote encontrar recuerdos al instante.
+  * **Interfaz Fluida y Asíncrona:** El escaneo de archivos y la carga de miniaturas se realizan en hilos separados (`QThread`, `QThreadPool`), evitando que la aplicación se congele, incluso con decenas de miles de fotos.
+  * **Carga Diferida (Lazy Loading):** Las miniaturas solo se cargan cuando son visibles (o están a punto de serlo), optimizando el uso de memoria y la velocidad de desplazamiento.
+  * **Caché de Base de Datos:** Utiliza `SQLite` para almacenar las rutas y las fechas (Año/Mes) de todas las fotos. Los escaneos posteriores son casi instantáneos, leyendo solo los archivos nuevos.
+  * **Editor de Fechas:** ¿Una foto escaneada o antigua tiene una fecha incorrecta? Puedes editar fácilmente el **Año** y el **Mes** en la base de datos a través del diálogo de detalles, sin modificar el archivo original.
+  * **Lector de Metadatos EXIF:** Extrae la fecha de captura (`DateTimeOriginal`) de tus fotos usando `Pillow` y `piexif`. Si no existe, utiliza la fecha de modificación del archivo como respaldo.
+  * **Visor de Detalles Avanzado:**
+      * Haz doble clic para abrir una vista de detalle con la imagen en alta resolución.
+      * **Zoom interactivo** dentro del visor de detalles.
+      * Muestra una **tabla completa con todos los metadatos EXIF** encontrados en el archivo.
+  * **Vista Previa Rápida (Quick-Look):** En la vista de miniaturas, mantén pulsado `Ctrl` y usa la **rueda del ratón** para una vista previa ampliada e instantánea de cualquier foto sin necesidad de abrirla.
+  * **Caché de Miniaturas:** Genera y guarda las miniaturas en un directorio local (`.visagevault_cache`) para una carga visual instantánea.
 
-1. Gestión de Datos y Persistencia (Backend)
+## 🔧 Pila Tecnológica (Tech Stack)
 
-    Persistencia de Datos (SQLite): Utiliza una base de datos local (visagevault.db) como fuente principal de verdad para el año y mes de cada fotografía, garantizando que las ediciones sean permanentes.
+  * **Python 3**
+  * **PySide6:** Para la interfaz gráfica de usuario (GUI).
+  * **SQLite3:** (Módulo nativo de Python) Para la base de datos.
+  * **Pillow (PIL):** Para la lectura de imágenes y generación de miniaturas.
+  * **piexif:** Para la lectura avanzada de metadatos EXIF.
 
-    Seguridad Multihilo: La clase VisageVaultDB gestiona las conexiones de SQLite de forma segura (_get_connection), eliminando los errores de RuntimeError al acceder a la base de datos desde el hilo de escaneo.
+## 📦 Instalación y Ejecución
 
-    Escaneo Inteligente: El PhotoFinderWorker solo calcula la fecha de la foto (EXIF/Modificación) para los archivos nuevos; para los archivos existentes, carga la fecha desde la BD, optimizando drásticamente los tiempos de escaneo.
+1.  **Clona el repositorio:**
 
-    Detección de Archivos: Escaneo recursivo de directorios para encontrar archivos con extensiones de imagen comunes (.jpg, .png, etc.).
+    ```bash
+    git clone https://github.com/danitxu79/VisageVault.git
+    cd VisageVault
+    ```
 
-2. Interfaz de Usuario y Experiencia (Frontend)
+2.  **Instala las dependencias:**
+    (Se recomienda crear un entorno virtual)
 
-    Organización Avanzada: Agrupación dinámica de las fotos en la vista principal por Año y Mes (ej. "2025" -> "Noviembre").
+    ```bash
+    pip install PySide6 Pillow piexif
+    ```
 
-    Navegación Jerárquica: Índice lateral navegable (usando QTreeWidget) que permite saltar instantáneamente a un año o mes específico.
+3.  **Ejecuta la aplicación:**
 
-    Visualización Fluida: Implementación de precarga asíncrona de miniaturas (ThumbnailLoader) que asegura que el scroll sea suave y que la interfaz de usuario nunca se congele durante la carga de imágenes.
+    ```bash
+    python visagevault.py
+    ```
 
-    Gestión de Espacio: El divisor (QSplitter) permite al usuario ajustar el tamaño de la cuadrícula de fotos y la barra lateral de navegación a su gusto.
+4.  **Primer Inicio:** La aplicación te pedirá que selecciones el directorio raíz que contiene todas tus fotografías. Comenzará el primer escaneo.
 
-3. Visor de Detalles y Edición
-
-    Edición Persistente de Fecha: El diálogo de detalles permite modificar el Año y el Mes mediante campos dedicados. Estos cambios se guardan en la BD y fuerzan la reubicación de la foto en la cuadrícula principal.
-
-    Zoom Interactivo: El ZoomableClickableLabel permite hacer zoom in/out con la rueda del ratón en la foto a tamaño completo.
-
-    Actualización Instantánea: Al guardar una fecha, la señal metadata_changed dispara la reconstrucción de la vista principal, moviendo la foto a su nueva ubicación sin necesidad de escanear el disco de nuevo.
-
-    Visualización de Metadatos: Muestra todos los metadatos EXIF disponibles en un formato de tabla.
-
-📘 Módulos Clave Implementados
-
-Módulo	                 Función Principal
-visagevault.py	         Controla la GUI (VisageVaultApp), gestiona hilos y coordina la actualización del modelo de datos.
-db_manager.py	         Gestiona la base de datos SQLite, asegura la integridad de los datos (year, month, filepath) y maneja conexiones seguras entre hilos.
-photo_finder.py	         Escaneo recursivo de archivos en el disco duro.
-metadata_reader.py	     Calcula el año/mes inicial de una foto (usando EXIF o fecha de modificación) y gestiona la lectura/escritura de metadatos EXIF.
-thumbnail_generator.py	 Crea y gestiona la caché local de miniaturas.
-
----
-
-## 💻 Requisitos del Sistema
-
-* **Sistema Operativo:** Linux (Probado en Bash/Desktop Environment).
-* **Python:** Versión 3.9 o superior.
-* **Hardware:** Se recomienda al menos 4 GB de RAM para el procesamiento de imágenes.
-
-### Instalación de Dependencias
-
-Se requiere un entorno virtual (`venv`) para aislar las dependencias del sistema:
-
-```bash
-# Crear y activar el entorno virtual
-python3 -m venv venv
-source venv/bin/activate
-
-# Instalar las librerías principales
-pip install PySide6 Pillow piexif
-
-
-### Instalación de Dependencias
-
+-----
 
 ## 📜 Licencia
 
-Este proyecto se ofrece bajo un modelo de Doble Licencia (Dual License), brindando máxima flexibilidad:
+Este proyecto se ofrece bajo un modelo de licenciamiento dual:
 
-1. Licencia Pública (LGPLv3)
+### 1\. Licencia Pública (LGPLv3)
 
-Este software está disponible bajo la GNU Lesser General Public License v3.0 (LGPLv3).
+Este software está disponible bajo la **GNU Lesser General Public License v3.0 (LGPLv3)**.
+
 Puedes usarlo libremente de acuerdo con los términos de la LGPLv3, lo cual es ideal para proyectos de código abierto. En resumen, esto significa que si usas esta biblioteca (especialmente si la modificas), debes cumplir con las obligaciones de la LGPLv3, como publicar el código fuente de tus modificaciones a esta biblioteca y permitir que los usuarios la reemplacen.
-Puedes encontrar el texto completo de la licencia en el archivo LICENSE de este repositorio.
 
-2. Licencia Comercial (Privativa)
+Puedes encontrar el texto completo de la licencia en el archivo `LICENSE` de este repositorio.
+
+### 2\. Licencia Comercial (Privativa)
 
 Si los términos de la LGPLv3 no se ajustan a tus necesidades, ofrezco una licencia comercial alternativa.
+
 Necesitarás una licencia comercial si, por ejemplo:
 
-    Deseas incluir el código en un software propietario (código cerrado) sin tener que publicar tus modificaciones.
-    Necesitas enlazar estáticamente (static linking) la biblioteca con tu aplicación propietaria.
-    Prefieres no estar sujeto a las obligaciones y restricciones de la LGPLv3.
+  * Deseas incluir el código en un software propietario (código cerrado) sin tener que publicar tus modificaciones.
+  * Necesitas enlazar estáticamente (static linking) la biblioteca con tu aplicación propietaria.
+  * Prefieres no estar sujeto a las obligaciones y restricciones de la LGPLv3.
 
 La licencia comercial te otorga el derecho a usar el código en tus aplicaciones comerciales de código cerrado sin las restricciones de la LGPLv3, a cambio de una tarifa.
-Para adquirir una licencia comercial o para más información, por favor, pónte en contacto conmigo en:
 
-dani.eus79@gmail.com
+Para adquirir una licencia comercial o para más información, por favor, pónte en contacto conmigo:
 
-
-## ✉️ Contacto
-
-Creado por **Daniel Serrano Armenta**
-
-* `dani.eus79@gmail.com`
-* Encuéntrame en GitHub: `@danitxu79`
-* Portafolio: `https://danitxu79.github.io/`
+  * **Nombre:** Daniel Serrano Armenta
+  * **Email:** dani.eus79@gmail.com
+  * **GitHub:** [danitxu79](https://github.com/danitxu79)
+  * **Portafolio:** [danitxu79.github.io](https://danitxu79.github.io/)
