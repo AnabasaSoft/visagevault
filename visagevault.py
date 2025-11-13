@@ -712,6 +712,10 @@ class VisageVaultApp(QMainWindow):
         self.thumb_signals = ThumbnailLoaderSignals()
         self.thumb_signals.thumbnail_loaded.connect(self._update_thumbnail)
         self.thumb_signals.load_failed.connect(self._handle_thumbnail_failed)
+        self.resize_timer = QTimer(self)
+        self.resize_timer.setSingleShot(True)
+        self.resize_timer.setInterval(200) # 200ms de espera
+        self.resize_timer.timeout.connect(self._handle_resize_timeout)
         self._setup_ui()
         QTimer.singleShot(100, self._initial_check)
 
@@ -850,8 +854,23 @@ class VisageVaultApp(QMainWindow):
             item = self.photo_container_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
         self.date_tree_widget.clear()
-        
+
         self.group_widgets = {} # Almacenará { 'year-month': widget }
+
+        # --- INICIO DE LA LÓGICA RESPONSIVE ---
+
+        # 1. Calcular el ancho disponible.
+        #    Restamos 30px para dar margen al borde y la barra de scroll.
+        viewport_width = self.scroll_area.viewport().width() - 30
+
+        # 2. Calcular el ancho de cada miniatura
+        #    (Tu código usa 128px + 10px de padding = 138px)
+        thumb_width = THUMBNAIL_SIZE[0] + 10
+
+        # 3. Calcular cuántas columnas caben (asegurando un mínimo de 1)
+        num_cols = max(1, viewport_width // thumb_width)
+
+        # --- FIN DE LA LÓGICA RESPONSIVE ---
 
         # Ordenar años (descendente) y meses (ascendente)
         sorted_years = sorted(self.photos_by_year_month.keys(), reverse=True)
@@ -862,7 +881,7 @@ class VisageVaultApp(QMainWindow):
             self.group_widgets[year] = None # Placeholder para el grupo del año
 
             sorted_months = sorted(self.photos_by_year_month[year].keys())
-            
+
             year_group_box = QGroupBox(f"Año {year}")
             year_group_box.setObjectName(f"group_{year}")
             year_main_layout = QVBoxLayout(year_group_box)
@@ -881,7 +900,7 @@ class VisageVaultApp(QMainWindow):
                         month_name = "Mes Desconocido"
                 except ValueError:
                     month_name = "Mes Desconocido"
-                
+
                 month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(photos)})"])
                 month_item.setData(0, Qt.UserRole, (year, month)) # Guardar año y mes
 
@@ -893,7 +912,10 @@ class VisageVaultApp(QMainWindow):
 
                 photo_grid_widget = QWidget()
                 photo_grid_layout = QGridLayout(photo_grid_widget)
-                
+
+                # --- NUEVO: Añadir espacio entre las miniaturas ---
+                photo_grid_layout.setSpacing(5)
+
                 for i, photo_path in enumerate(photos):
                     photo_label = ZoomableClickableLabel(photo_path)
                     photo_label.is_thumbnail_view = True
@@ -904,9 +926,12 @@ class VisageVaultApp(QMainWindow):
                     photo_label.setProperty("original_path", photo_path)
                     photo_label.setProperty("loaded", False)
                     photo_label.doubleClickedPath.connect(self._open_photo_detail)
-                    row, col = i // 5, i % 5
+
+                    # --- MODIFICADO: Usamos 'num_cols' en lugar de '5' ---
+                    row, col = i // num_cols, i % num_cols
+
                     photo_grid_layout.addWidget(photo_label, row, col)
-                
+
                 year_main_layout.addWidget(photo_grid_widget)
 
             self.photo_container_layout.addWidget(year_group_box)
@@ -1012,6 +1037,26 @@ class VisageVaultApp(QMainWindow):
                  default_sizes[0] = default_width - min_right_width
 
             self.main_splitter.setSizes(default_sizes)
+
+    def resizeEvent(self, event):
+        """Se llama cada vez que la ventana cambia de tamaño."""
+        # Reinicia el temporizador cada vez que nos movemos
+        self.resize_timer.start()
+        # Llama al evento original
+        super().resizeEvent(event)
+
+    @Slot()
+    def _handle_resize_timeout(self):
+        """
+        Se llama 200ms después de que el usuario DEJA de redimensionar.
+        Vuelve a dibujar la cuadrícula con el nuevo tamaño.
+        """
+        # Si no hay fotos cargadas, no hagas nada
+        if not self.photos_by_year_month:
+            return
+
+        print(f"Redibujando layout para el nuevo ancho.")
+        self._display_photos()
 
     @Slot()
     def _on_scan_thread_finished(self):
