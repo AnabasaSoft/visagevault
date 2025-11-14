@@ -227,18 +227,28 @@ class VisageVaultDB:
             conn.close()
 
     def get_faces_for_person(self, person_id: int) -> list:
-        """Devuelve todas las fotos asociadas con una persona."""
+        """
+        Devuelve las fotos (filepath, year, month) asociadas con
+        una persona, ordenadas por fecha y sin duplicados.
+        """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
+
+            # --- MODIFICACIÓN ---
+            # Seleccionamos 'DISTINCT' (para no repetir fotos)
+            # y añadimos 'p.year' y 'p.month'.
             cursor.execute("""
-                SELECT p.filepath, f.location
+                SELECT DISTINCT p.filepath, p.year, p.month
                 FROM photos p
                 JOIN faces f ON p.id = f.photo_id
                 JOIN face_labels fl ON f.id = fl.face_id
                 WHERE fl.person_id = ?
+                ORDER BY p.year DESC, p.month DESC
             """, (person_id,))
-            return cursor.fetchall()
+            # --- FIN DE MODIFICACIÓN ---
+
+            return cursor.fetchall() # Devuelve una lista de filas (dict-like)
         finally:
             conn.close()
 

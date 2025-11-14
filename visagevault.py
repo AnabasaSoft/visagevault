@@ -67,7 +67,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QStyle, QFileDialog,
     QScrollArea, QGridLayout, QLabel, QGroupBox, QSpacerItem, QSizePolicy,
-    QSplitter, QTabWidget
+    QSplitter, QTabWidget, QStackedWidget
 )
 from PySide6.QtCore import (
     Qt, QSize, QObject, Signal, QThread, Slot, QTimer,
@@ -1277,7 +1277,7 @@ class VisageVaultApp(QMainWindow):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(photo_area_widget)
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_thumbnails)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_main_visible_thumbnails)
         self.main_splitter.addWidget(self.scroll_area)
         # --- (Fin: Lado Izquierdo: Fotos) ---
 
@@ -1316,12 +1316,15 @@ class VisageVaultApp(QMainWindow):
         # 5a. Crear el Splitter para la pestaña "Personas"
         self.people_splitter = QSplitter(Qt.Horizontal)
 
-        # 5b. Panel Izquierdo (Cuadrícula de Caras)
+        # 5b. Panel Izquierdo (Contenedor "Stack")
+        #    Usamos un QStackedWidget para intercambiar las vistas de
+        #    "Caras Sin Asignar" y "Fotos de Persona".
+        self.left_people_stack = QStackedWidget()
+
+        # --- Pagina 0: Cuadrícula de Caras ---
         face_area_widget = QWidget()
         self.face_container_layout = QVBoxLayout(face_area_widget)
 
-        # Aquí crearemos la cuadrícula, pero la pondremos dentro de un GroupBox
-        # Empezamos con las caras "Sin Asignar"
         self.unknown_faces_group = QGroupBox("Caras Sin Asignar")
         self.unknown_faces_layout = QGridLayout(self.unknown_faces_group)
         self.unknown_faces_layout.setSpacing(10)
@@ -1332,12 +1335,32 @@ class VisageVaultApp(QMainWindow):
         self.face_scroll_area = QScrollArea()
         self.face_scroll_area.setWidgetResizable(True)
         self.face_scroll_area.setWidget(face_area_widget)
-        self.people_splitter.addWidget(self.face_scroll_area)
+
+        # Añadir al stack en el índice 0
+        self.left_people_stack.addWidget(self.face_scroll_area)
+
+        # --- Pagina 1: Cuadrícula de Fotos de Persona ---
+        self.person_photo_scroll_area = QScrollArea()
+        self.person_photo_scroll_area.setWidgetResizable(True)
+
+        person_photo_widget = QWidget()
+        self.person_photo_layout = QVBoxLayout(person_photo_widget)
+        self.person_photo_scroll_area.setWidget(person_photo_widget)
+
+        self.person_photo_scroll_area.verticalScrollBar().valueChanged.connect(self._load_person_visible_thumbnails)
+
+        # Añadir al stack en el índice 1
+        self.left_people_stack.addWidget(self.person_photo_scroll_area)
+
+        # --- Fin de las Páginas del Stack ---
+
+        # Añadimos el STACK (índice 0) al splitter
+        self.people_splitter.addWidget(self.left_people_stack)
 
         # 5c. Panel Derecho (El "Cajón" de Nombres de Personas)
         people_panel_widget = QWidget()
         people_panel_layout = QVBoxLayout(people_panel_widget)
-        people_panel_widget.setMinimumWidth(180) # Igual que el panel de navegación
+        people_panel_widget.setMinimumWidth(180)
         people_panel_widget.setMaximumWidth(450)
 
         people_label = QLabel("Navegación por Personas:")
@@ -1345,27 +1368,32 @@ class VisageVaultApp(QMainWindow):
 
         self.people_tree_widget = QTreeWidget()
         self.people_tree_widget.setHeaderHidden(True)
-        # self.people_tree_widget.currentItemChanged.connect(self._scroll_to_person)
+        self.people_tree_widget.currentItemChanged.connect(self._on_person_selected)
         people_panel_layout.addWidget(self.people_tree_widget)
 
-        # Botón para agrupar duplicados
         self.cluster_faces_button = QPushButton("Buscar Duplicados")
         self.cluster_faces_button.clicked.connect(self._start_clustering)
-
         people_panel_layout.addWidget(self.cluster_faces_button)
 
-        # Botones de acción (ej: "Nueva Persona")
         self.add_person_button = QPushButton("Añadir Persona")
-        # self.add_person_button.clicked.connect(self._add_new_person)
         people_panel_layout.addWidget(self.add_person_button)
 
+        # Añadimos el CAJÓN (índice 1) al splitter
         self.people_splitter.addWidget(people_panel_widget)
 
         # 5d. Añadir el splitter de personas al layout de la pestaña
         personas_layout.addWidget(self.people_splitter)
 
-        # 5e. Ajustar tamaños del splitter de personas
-        self.people_splitter.setSizes([int(self.width() * 0.8), int(self.width() * 0.2)])
+        # 5e. Ajustar tamaños del splitter (AHORA SOLO TIENE 2 WIDGETS)
+        default_width = self.width()
+        min_right_width = 180
+
+        left_width = default_width - min_right_width
+        if left_width < 100: left_width = 100
+
+        # [0] self.left_people_stack
+        # [1] people_panel_widget (el "cajón")
+        self.people_splitter.setSizes([left_width, min_right_width])
 
         # 6. Añadir las pestañas al TabWidget
         self.tab_widget.addTab(fotos_tab_widget, "Fotos")
@@ -1558,7 +1586,7 @@ class VisageVaultApp(QMainWindow):
             year_item.setExpanded(True)
 
         self.photo_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_visible_thumbnails)
+        QTimer.singleShot(100, self._load_main_visible_thumbnails)
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_item(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
@@ -1576,7 +1604,7 @@ class VisageVaultApp(QMainWindow):
         target_widget = self.group_widgets.get(target_key)
         if target_widget:
             self.scroll_area.ensureWidgetVisible(target_widget, 50, 50)
-            QTimer.singleShot(200, self._load_visible_thumbnails)
+            QTimer.singleShot(200, self._load_main_visible_thumbnails)
 
     @Slot(dict)
     def _handle_search_finished(self, photos_by_year_month):
@@ -1589,7 +1617,7 @@ class VisageVaultApp(QMainWindow):
     def _set_status(self, message):
         self.status_label.setText(f"Estado: {message}")
 
-    def _load_visible_thumbnails(self):
+    def _load_main_visible_thumbnails(self):
         viewport = self.scroll_area.viewport()
         preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
         for photo_label in self.scroll_area.widget().findChildren(QLabel):
@@ -1603,23 +1631,71 @@ class VisageVaultApp(QMainWindow):
                     loader = ThumbnailLoader(original_path, self.thumb_signals)
                     self.threadpool.start(loader)
 
+    @Slot()
+    def _load_person_visible_thumbnails(self):
+        """
+        Carga las miniaturas visibles en el QScrollArea de la
+        pestaña "PERSONAS".
+        """
+        viewport = self.person_photo_scroll_area.viewport()
+        preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
+
+        # Buscar labels dentro del widget contenedor (person_photo_layout)
+        person_photo_widget = self.person_photo_scroll_area.widget()
+        if not person_photo_widget:
+            return
+
+        # Buscar todos los ZoomableClickableLabel que son miniaturas
+        for photo_label in person_photo_widget.findChildren(ZoomableClickableLabel):
+            original_path = photo_label.property("original_path")
+            is_loaded = photo_label.property("loaded")
+
+            if original_path and is_loaded is False:
+                label_pos = photo_label.mapTo(viewport, photo_label.rect().topLeft())
+                label_rect_in_viewport = photo_label.rect().translated(label_pos)
+
+                if preload_rect.intersects(label_rect_in_viewport):
+                    photo_label.setProperty("loaded", None)
+                    loader = ThumbnailLoader(original_path, self.thumb_signals)
+                    self.threadpool.start(loader)
+
     @Slot(str, QPixmap)
     def _update_thumbnail(self, original_path: str, pixmap: QPixmap):
-        for photo_label in self.scroll_area.widget().findChildren(QLabel):
-            if photo_label.property("original_path") == original_path:
-                photo_label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                photo_label.setText("")
-                photo_label.setProperty("loaded", True)
-                break
+        # Helper function to find and update ALL matching labels in a given container
+        def update_in_container(container_widget):
+            if not container_widget:
+                return
+            
+            # Using ZoomableClickableLabel is more specific
+            for label in container_widget.findChildren(ZoomableClickableLabel):
+                # Update if path matches and it's not already loaded
+                if label.property("original_path") == original_path and label.property("loaded") is not True:
+                    label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    label.setText("")
+                    label.setProperty("loaded", True)
+                    # Don't return, in case the same photo appears multiple times
+
+        # Update all matching labels in the "Fotos" tab
+        update_in_container(self.scroll_area.widget())
+        # Update all matching labels in the "Personas" tab
+        update_in_container(self.person_photo_scroll_area.widget())
 
     @Slot(str)
     def _handle_thumbnail_failed(self, original_path: str):
         """Maneja el caso en que la miniatura no se pudo cargar."""
-        for photo_label in self.scroll_area.widget().findChildren(QLabel):
-            if photo_label.property("original_path") == original_path:
-                photo_label.setText("Error al cargar.")
-                photo_label.setProperty("loaded", True) # Marcar como "terminado" para no reintentar
-                break
+        # Helper function to find and update ALL matching labels in a given container
+        def fail_in_container(container_widget):
+            if not container_widget:
+                return
+            for label in container_widget.findChildren(ZoomableClickableLabel):
+                if label.property("original_path") == original_path and label.property("loaded") is not True:
+                    label.setText("Error al cargar.")
+                    label.setProperty("loaded", True) # Mark as "done" to avoid retrying
+
+        # Update all matching labels in the "Fotos" tab
+        fail_in_container(self.scroll_area.widget())
+        # Update all matching labels in the "Personas" tab
+        fail_in_container(self.person_photo_scroll_area.widget())
 
     @Slot()
     def _save_splitter_state(self):
@@ -1792,32 +1868,33 @@ class VisageVaultApp(QMainWindow):
         # Seleccionar "Caras Sin Asignar" por defecto
         self.people_tree_widget.setCurrentItem(unknown_item)
 
-    def _load_existing_faces_async(self):
+    def _populate_face_grid_async(self, face_list: list):
         """
-        Carga las caras existentes de la BD de forma asíncrona.
-        Limpia la cuadrícula y la vuelve a poblar.
+        (Función Helper) Limpia el grid y lo puebla asíncronamente
+        con la lista de caras (rows) proporcionada.
         """
-
         # 1. Limpiar la cuadrícula y resetear el contador
-        #    (Esta es la parte que faltaba)
         while self.unknown_faces_layout.count() > 0:
             item = self.unknown_faces_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
         self.current_face_count = 0
 
-        # 2. Obtener las caras que QUEDAN sin asignar
-        unknown_faces = self.db.get_unknown_faces() # Rápido
-        if not unknown_faces:
-            # self.current_face_count ya es 0
+        if not face_list:
+            # Si la lista está vacía, mostrar un placeholder
+            placeholder = QLabel("No se han encontrado caras.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self.unknown_faces_layout.addWidget(placeholder, 0, 0, Qt.AlignCenter)
             return
 
-        self.current_face_count = len(unknown_faces)
+        self.current_face_count = len(face_list)
 
-        # 3. Calcular el grid
-        num_cols = max(1, (self.face_scroll_area.viewport().width() - 30) // 110)
+        # 2. Calcular el grid
+        # Obtenemos el ancho del panel 0 del splitter (que es 'face_scroll_area')
+        viewport_width = self.left_people_stack.width() - 30
+        num_cols = max(1, viewport_width // 110)
 
-        # 4. Volver a poblar la cuadrícula solo con los placeholders
-        for i, face_row in enumerate(unknown_faces):
+        # 3. Volver a poblar la cuadrícula solo con los placeholders
+        for i, face_row in enumerate(face_list):
             face_id = face_row['id']
 
             # Crear un *placeholder*
@@ -1836,8 +1913,22 @@ class VisageVaultApp(QMainWindow):
                 face_row['filepath'],
                 face_row['location']
             )
-            # El QThreadPool hará el trabajo pesado
             self.threadpool.start(loader)
+
+    def _load_existing_faces_async(self):
+        """
+        Carga las caras SIN ASIGNAR.
+        (Ahora solo es un contenedor para el helper)
+        """
+        # 1. Cambiar el título del GroupBox
+        self.unknown_faces_group.setTitle("Caras Sin Asignar")
+
+        # 2. Activar el botón de duplicados
+        self.cluster_faces_button.setEnabled(True)
+
+        # 3. Obtener datos y llamar al helper
+        unknown_faces = self.db.get_unknown_faces() #
+        self._populate_face_grid_async(unknown_faces)
 
     @Slot()
     def _on_face_clicked(self):
@@ -2144,6 +2235,130 @@ class VisageVaultApp(QMainWindow):
 
         # Llamada recursiva para el siguiente grupo
         QTimer.singleShot(100, self._process_cluster_queue)
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _on_person_selected(self, current: QTreeWidgetItem, previous: QTreeWidgetItem):
+        """
+        Se llama al hacer clic en un item del árbol de personas.
+        Filtra la cuadrícula de caras.
+        """
+        if not current:
+            return
+
+        person_id = current.data(0, Qt.UserRole)
+        person_name = current.text(0)
+
+        if person_id == -1:
+            # --- VISTA: "Caras Sin Asignar" ---
+            self._set_status("Mostrando caras sin asignar.")
+
+            # --- MODIFICACIÓN ---
+            # Mostrar la página 0 (caras) del stack
+            self.left_people_stack.setCurrentIndex(0)
+
+            # Activar botones de clustering
+            self.cluster_faces_button.setEnabled(True)
+            self.add_person_button.setEnabled(True)
+
+            # Recargar la cuadrícula de caras
+            self._load_existing_faces_async()
+
+        elif person_id:
+            # --- VISTA: "Fotos de [Persona]" ---
+            self._set_status(f"Mostrando caras de {person_name}.")
+
+            # --- MODIFICACIÓN ---
+            # Mostrar la página 1 (fotos) del stack
+            self.left_people_stack.setCurrentIndex(1)
+
+            # Desactivar botones (no aplican aquí)
+            self.cluster_faces_button.setEnabled(False)
+            self.add_person_button.setEnabled(False)
+
+            # Obtener las fotos de la persona
+            person_photos = self.db.get_faces_for_person(person_id)
+
+            # Llamar al nuevo método para dibujar las fotos
+            self._display_person_photos(person_photos, person_name)
+
+    def _display_person_photos(self, photos_list: list, person_name: str):
+        """
+        Toma una lista de fotos (con 'filepath', 'year', 'month')
+        y las dibuja agrupadas en 'self.person_photo_layout'.
+        """
+        # 1. Limpiar el contenedor
+        while self.person_photo_layout.count() > 0:
+            item = self.person_photo_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        if not photos_list:
+            placeholder = QLabel(f"No se encontraron fotos para {person_name}.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self.person_photo_layout.addWidget(placeholder)
+            return
+
+        # 2. Procesar la lista y agruparla en un diccionario
+        # (Esto es lo que hace PhotoFinderWorker internamente)
+        photos_by_year_month = {}
+        for row in photos_list:
+            path, year, month = row['filepath'], row['year'], row['month']
+
+            if year not in photos_by_year_month:
+                photos_by_year_month[year] = {}
+            if month not in photos_by_year_month[year]:
+                photos_by_year_month[year][month] = []
+            photos_by_year_month[year][month].append(path)
+
+        # 3. Calcular columnas (igual que en _display_photos)
+        # Obtenemos el ancho del panel 1 del splitter (que es 'person_photo_scroll_area')
+        viewport_width = self.left_people_stack.width() - 30
+        thumb_width = THUMBNAIL_SIZE[0] + 10
+        num_cols = max(1, viewport_width // thumb_width)
+
+        # 4. Dibujar los grupos (lógica copiada de _display_photos)
+        sorted_years = sorted(photos_by_year_month.keys(), reverse=True)
+
+        for year in sorted_years:
+            sorted_months = sorted(photos_by_year_month[year].keys(), reverse=True)
+
+            for month in sorted_months:
+                photos = photos_by_year_month[year][month]
+                if not photos: continue
+
+                # Añadir separador de Mes/Año
+                try:
+                    month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
+                except ValueError:
+                    month_name = "Mes Desconocido"
+
+                group_label = QLabel(f"{month_name} {year}")
+                group_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
+                self.person_photo_layout.addWidget(group_label)
+
+                # Añadir rejilla de fotos para el mes
+                photo_grid_widget = QWidget()
+                photo_grid_layout = QGridLayout(photo_grid_widget)
+                photo_grid_layout.setSpacing(5)
+
+                for i, photo_path in enumerate(photos):
+                    photo_label = ZoomableClickableLabel(photo_path)
+                    photo_label.is_thumbnail_view = True # Es una miniatura
+                    photo_label.setFixedSize(THUMBNAIL_SIZE[0] + 10, THUMBNAIL_SIZE[1] + 25)
+                    photo_label.setToolTip(photo_path)
+                    photo_label.setAlignment(Qt.AlignCenter)
+                    photo_label.setText(Path(photo_path).name.split('.')[0] + "\nCargando...")
+                    photo_label.setProperty("original_path", photo_path)
+                    photo_label.setProperty("loaded", False)
+                    photo_label.doubleClickedPath.connect(self._open_photo_detail)
+
+                    row, col = i // num_cols, i % num_cols
+                    photo_grid_layout.addWidget(photo_label, row, col)
+
+                self.person_photo_layout.addWidget(photo_grid_widget)
+
+        self.person_photo_layout.addStretch(1)
+        # 5. Cargar las miniaturas visibles
+        QTimer.singleShot(100, self._load_person_visible_thumbnails)
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""
