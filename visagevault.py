@@ -93,6 +93,16 @@ from PIL import Image
 import ast
 import pickle
 
+def resource_path(relative_path):
+    """ Obtiene la ruta absoluta al recurso, funciona para dev y para PyInstaller """
+    try:
+        # PyInstaller crea una carpeta temporal y guarda la ruta en _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 # --- Configuración regional para nombres de meses ---
 try:
     locale.setlocale(locale.LC_TIME, '')
@@ -1264,7 +1274,11 @@ class VisageVaultApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VisageVault")
-        self.setWindowIcon(QIcon("visagevault.png"))
+        icon_path = resource_path("visagevault.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        else:
+            print(f"Advertencia: No se pudo encontrar el icono en {icon_path}")
         self.setMinimumSize(QSize(900, 600))
         self.db = VisageVaultDB()
         self.current_directory = None

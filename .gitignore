@@ -5,6 +5,12 @@
 venv/
 .venv/
 env/
+
+# Compilación APPImage
+build/
+dist/
+AppDir/
+
 # Archivos de caché
 __pycache__/
 *.pyc
