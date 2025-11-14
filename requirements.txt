@@ -5,3 +5,4 @@ face_recognition
 setuptools
 scikit-learn
 mypy
+numpy
