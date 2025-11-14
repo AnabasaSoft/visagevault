@@ -1,8 +1,4 @@
-Claro, aquí tienes una actualización completa para tu archivo `README.md`.
 
-Este borrador incluye una descripción de las características, los requisitos (tanto de Python como del sistema, que fueron cruciales durante la compilación) y las instrucciones de instalación y compilación.
-
-Puedes copiar y pegar este contenido directamente en tu archivo `README.md`.
 
 -----
 
