@@ -365,6 +365,7 @@ class CircularFaceLabel(QLabel):
     y emite una señal 'clicked' cuando se presiona.
     """
     clicked = Signal()
+    rightClicked = Signal(QPoint)
 
     def __init__(self, pixmap: QPixmap, parent=None):
         super().__init__(parent)
@@ -402,9 +403,11 @@ class CircularFaceLabel(QLabel):
         painter.end()
 
     def mousePressEvent(self, event):
-        """Emite la señal 'clicked' al hacer clic."""
+        """Emite la señal 'clicked' al hacer clic izquierdo y 'rightClicked' con el derecho."""
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
+        elif event.button() == Qt.RightButton:
+            self.rightClicked.emit(event.globalPos())
         super().mousePressEvent(event)
 
 # =================================================================
@@ -850,7 +853,9 @@ class FaceClusterDialog(QDialog):
     Un QDialog que muestra un grupo de caras (IDs) y permite asignarlas
     a una persona (nueva o existente).
     """
-    SkipRole = QDialog.Accepted + 1 # (Esto será '2')
+    SkipRole = QDialog.Accepted + 1
+    DeleteRole = QDialog.Accepted + 2
+
     def __init__(self, db: VisageVaultDB, threadpool: QThreadPool,
                  face_ids: list, parent=None):
 
@@ -912,6 +917,11 @@ class FaceClusterDialog(QDialog):
         # Añadimos el botón "Siguiente" manualmente
         self.skip_button = self.button_box.addButton("Siguiente", QDialogButtonBox.ButtonRole.ActionRole)
         self.skip_button.clicked.connect(self._skip) # Conectar al nuevo slot
+
+        # Añadimos el botón de eliminar
+        self.delete_button = self.button_box.addButton("Eliminar caras", QDialogButtonBox.ButtonRole.DestructiveRole)
+        self.delete_button.clicked.connect(self._delete_and_reject)
+
 
         self.button_box.accepted.connect(self._save_and_accept)
         self.button_box.rejected.connect(self.reject)
@@ -1069,6 +1079,13 @@ class FaceClusterDialog(QDialog):
         """Cierra el diálogo con el código 'SkipRole'."""
         # Usamos .done() para cerrar el diálogo y devolver nuestro código (2)
         self.done(self.SkipRole)
+
+    @Slot()
+    def _delete_and_reject(self):
+        """Marca todas las caras del diálogo como eliminadas y cierra."""
+        if self.face_ids:
+            self.db.bulk_soft_delete_faces(self.face_ids)
+        self.done(self.DeleteRole)
 
 # =================================================================
 # CLASE TRABAJADORA DEL ESCANEO (MODIFICADA)
@@ -1381,6 +1398,10 @@ class VisageVaultApp(QMainWindow):
         self.people_tree_widget.setHeaderHidden(True)
         self.people_tree_widget.currentItemChanged.connect(self._on_person_selected)
         people_panel_layout.addWidget(self.people_tree_widget)
+
+        self.show_deleted_faces_button = QPushButton("Ver caras eliminadas")
+        self.show_deleted_faces_button.clicked.connect(self._show_deleted_faces)
+        people_panel_layout.addWidget(self.show_deleted_faces_button)
 
         self.cluster_faces_button = QPushButton("Buscar Duplicados")
         self.cluster_faces_button.clicked.connect(self._start_clustering)
@@ -1858,6 +1879,11 @@ class VisageVaultApp(QMainWindow):
         unknown_item = QTreeWidgetItem(self.people_tree_widget, ["Caras Sin Asignar"])
         unknown_item.setData(0, Qt.UserRole, -1) # -1 significa "sin asignar"
 
+        # Item para caras eliminadas
+        deleted_item = QTreeWidgetItem(self.people_tree_widget, ["Caras Eliminadas"])
+        deleted_item.setData(0, Qt.UserRole, -2) # -2 significa "eliminadas"
+
+
         # 2. Cargar las personas de la BD
         people = self.db.get_all_people() #
 
@@ -1879,7 +1905,7 @@ class VisageVaultApp(QMainWindow):
         # Seleccionar "Caras Sin Asignar" por defecto
         self.people_tree_widget.setCurrentItem(unknown_item)
 
-    def _populate_face_grid_async(self, face_list: list):
+    def _populate_face_grid_async(self, face_list: list, is_deleted_view: bool = False):
         """
         (Función Helper) Limpia el grid y lo puebla asíncronamente
         con la lista de caras (rows) proporcionada.
@@ -1912,6 +1938,10 @@ class VisageVaultApp(QMainWindow):
             face_widget = CircularFaceLabel(QPixmap()) # Pixmap vacío
             face_widget.setText("...") # Pone "..."
             face_widget.setProperty("face_id", face_id)
+            face_widget.setProperty("is_deleted_view", is_deleted_view)
+            face_widget.rightClicked.connect(self._on_face_right_clicked)
+            face_widget.clicked.connect(self._on_face_clicked)
+
 
             # Añadir placeholder al grid
             row, col = i // num_cols, i % num_cols
@@ -1936,10 +1966,12 @@ class VisageVaultApp(QMainWindow):
 
         # 2. Activar el botón de duplicados
         self.cluster_faces_button.setEnabled(True)
+        self.show_deleted_faces_button.setEnabled(True)
+
 
         # 3. Obtener datos y llamar al helper
         unknown_faces = self.db.get_unknown_faces() #
-        self._populate_face_grid_async(unknown_faces)
+        self._populate_face_grid_async(unknown_faces, is_deleted_view=False)
 
     @Slot()
     def _on_face_clicked(self):
@@ -1949,6 +1981,10 @@ class VisageVaultApp(QMainWindow):
         """
         sender_widget = self.sender()
         if not sender_widget:
+            return
+
+        # Si estamos en la vista de eliminados, el clic izquierdo no hace nada
+        if sender_widget.property("is_deleted_view"):
             return
 
         face_id = sender_widget.property("face_id")
@@ -1985,6 +2021,81 @@ class VisageVaultApp(QMainWindow):
             self._load_existing_faces_async()
         else:
             self._set_status("Etiquetado cancelado.")
+
+    @Slot(QPoint)
+    def _on_face_right_clicked(self, pos):
+        """Muestra un menú contextual al hacer clic derecho en una cara."""
+        sender_widget = self.sender()
+        if not sender_widget:
+            return
+
+        face_id = sender_widget.property("face_id")
+        is_deleted_view = sender_widget.property("is_deleted_view")
+
+        menu = QMenu(self)
+
+        if is_deleted_view:
+            restore_action = menu.addAction("Restaurar cara")
+            restore_action.triggered.connect(lambda: self._restore_face(face_id, sender_widget))
+        else:
+            delete_action = menu.addAction("Eliminar cara reconocida")
+            delete_action.triggered.connect(lambda: self._delete_face(face_id, sender_widget))
+
+        menu.exec(pos)
+
+    def _delete_face(self, face_id: int, widget: QWidget):
+        """Marca una cara como eliminada y la quita de la UI."""
+        self.db.soft_delete_face(face_id)
+        widget.deleteLater()
+        self._set_status(f"Cara ID {face_id} eliminada.")
+
+    def _restore_face(self, face_id: int, widget: QWidget):
+        """Restaura una cara y la quita de la vista de eliminados."""
+        self.db.restore_face(face_id)
+        widget.deleteLater()
+        self._set_status(f"Cara ID {face_id} restaurada.")
+
+
+    @Slot()
+    def _show_deleted_faces(self):
+        """Carga y muestra las caras marcadas como eliminadas."""
+        self.left_people_stack.setCurrentIndex(0)
+        self.unknown_faces_group.setTitle("Caras Eliminadas")
+        self.cluster_faces_button.setEnabled(False)
+        self.show_deleted_faces_button.setEnabled(False)
+
+
+        deleted_faces = self.db.get_deleted_faces()
+        self._populate_face_grid_async(deleted_faces, is_deleted_view=True)
+        self._set_status(f"Mostrando {len(deleted_faces)} caras eliminadas.")
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _on_person_selected(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
+        """
+        Se llama cuando el usuario selecciona un item en el árbol de personas.
+        """
+        if not current_item:
+            return
+
+        person_id = current_item.data(0, Qt.UserRole)
+
+        # --- Lógica para cambiar la vista ---
+
+        # ID -1: Caras Sin Asignar
+        if person_id == -1:
+            self.left_people_stack.setCurrentIndex(0)
+            self._load_existing_faces_async()
+
+        # ID -2: Caras Eliminadas
+        elif person_id == -2:
+            self.left_people_stack.setCurrentIndex(0)
+            self._show_deleted_faces()
+
+        # ID >= 0: Una persona real
+        else:
+            self.left_people_stack.setCurrentIndex(1)
+            person_name = current_item.text(0)
+            self._load_photos_for_person(person_id, person_name)
 
     @Slot(int)
     def _update_face_scan_percentage(self, percentage):

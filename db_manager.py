@@ -57,6 +57,13 @@ class VisageVaultDB:
                 )
             """)
 
+            # --- MIGRACIÓN: Añadir columna 'is_deleted' a faces si no existe ---
+            cursor.execute("PRAGMA table_info(faces)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if 'is_deleted' not in columns:
+                print("Migrando base de datos: añadiendo columna 'is_deleted' a la tabla faces...")
+                cursor.execute("ALTER TABLE faces ADD COLUMN is_deleted INTEGER DEFAULT 0")
+
             # 3. Tabla PEOPLE (Etiquetas de personas)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS people (
@@ -209,18 +216,74 @@ class VisageVaultDB:
         finally:
             conn.close()
 
-    def get_unknown_faces(self) -> list:
-        """Devuelve todas las caras que aún no están asignadas a una persona."""
+    def soft_delete_face(self, face_id: int):
+        """Marca una cara como eliminada (soft delete)."""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            # Busca caras (faces.id) que NO están en la tabla face_labels
+            cursor.execute("UPDATE faces SET is_deleted = 1 WHERE id = ?", (face_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en soft_delete_face: {e}")
+        finally:
+            conn.close()
+
+    def restore_face(self, face_id: int):
+        """Restaura una cara marcada como eliminada."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE faces SET is_deleted = 0 WHERE id = ?", (face_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en restore_face: {e}")
+        finally:
+            conn.close()
+
+    def bulk_soft_delete_faces(self, face_ids: list[int]):
+        """Marca un lote de caras como eliminadas."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            # Preparamos los datos como una lista de tuplas para executemany
+            data = [(face_id,) for face_id in face_ids]
+            cursor.executemany("UPDATE faces SET is_deleted = 1 WHERE id = ?", data)
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en bulk_soft_delete_faces: {e}")
+        finally:
+            conn.close()
+
+    def get_deleted_faces(self) -> list:
+        """Devuelve todas las caras que están marcadas como eliminadas."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT f.id, f.photo_id, f.location, p.filepath
+                FROM faces f
+                JOIN photos p ON f.photo_id = p.id
+                WHERE f.is_deleted = 1
+            """)
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    def get_unknown_faces(self) -> list:
+        """
+        Devuelve todas las caras que aún no están asignadas a una persona
+        y no están marcadas como eliminadas.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            # Busca caras que no están etiquetadas Y no están eliminadas
             cursor.execute("""
                 SELECT f.id, f.photo_id, f.location, p.filepath
                 FROM faces f
                 JOIN photos p ON f.photo_id = p.id
                 LEFT JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id IS NULL
+                WHERE fl.person_id IS NULL AND f.is_deleted = 0
             """)
             return cursor.fetchall()
         finally:
@@ -229,21 +292,20 @@ class VisageVaultDB:
     def get_faces_for_person(self, person_id: int) -> list:
         """
         Devuelve las fotos (filepath, year, month) asociadas con
-        una persona, ordenadas por fecha y sin duplicados.
+        una persona, ordenadas por fecha y sin duplicados, excluyendo caras eliminadas.
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
 
             # --- MODIFICACIÓN ---
-            # Seleccionamos 'DISTINCT' (para no repetir fotos)
-            # y añadimos 'p.year' y 'p.month'.
+            # Seleccionamos 'DISTINCT' y añadimos 'f.is_deleted = 0'
             cursor.execute("""
                 SELECT DISTINCT p.filepath, p.year, p.month
                 FROM photos p
                 JOIN faces f ON p.id = f.photo_id
                 JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id = ?
+                WHERE fl.person_id = ? AND f.is_deleted = 0
                 ORDER BY p.year DESC, p.month DESC
             """, (person_id,))
             # --- FIN DE MODIFICACIÓN ---
@@ -298,18 +360,18 @@ class VisageVaultDB:
     def get_unknown_face_encodings(self) -> list:
         """
         Devuelve una lista de tuplas (face_id, encoding) para todas las
-        caras que aún no están asignadas a una persona.
+        caras que aún no están asignadas a una persona y no están eliminadas.
         """
         conn = self._get_connection()
         face_data = []
         try:
             cursor = conn.cursor()
-            # Busca caras (f.id) que NO están en la tabla face_labels
+            # Busca caras que no están etiquetadas Y no están eliminadas
             cursor.execute("""
                 SELECT f.id, f.encoding
                 FROM faces f
                 LEFT JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id IS NULL
+                WHERE fl.person_id IS NULL AND f.is_deleted = 0
             """)
 
             for row in cursor.fetchall():
