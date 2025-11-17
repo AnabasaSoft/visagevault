@@ -11,6 +11,7 @@ class VisageVaultDB:
     """
     def __init__(self, db_file="visagevault.db"):
         self.db_file = db_file
+        # --- MODIFICADO: create_tables() ahora se llama desde __init__ ---
         self.create_tables()
 
     def _get_connection(self):
@@ -32,11 +33,12 @@ class VisageVaultDB:
                     filepath TEXT NOT NULL UNIQUE,
                     file_hash TEXT UNIQUE,
                     year TEXT,
-                    month TEXT
+                    month TEXT,
+                    faces_scanned INTEGER DEFAULT 0
                 )
             """)
 
-            # --- MIGRACIÓN: Añadir columna 'month' si no existe ---
+            # --- MIGRACIÓN: Añadir columna 'month' y 'faces_scanned' si no existe ---
             cursor.execute("PRAGMA table_info(photos)")
             columns = [info[1] for info in cursor.fetchall()]
             if 'month' not in columns:
@@ -46,6 +48,17 @@ class VisageVaultDB:
                 print("Migrando base de datos: añadiendo columna 'faces_scanned'...")
                 cursor.execute("ALTER TABLE photos ADD COLUMN faces_scanned INTEGER DEFAULT 0")
 
+            # --- ¡NUEVA TABLA DE VÍDEOS! ---
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS videos (
+                    id INTEGER PRIMARY KEY,
+                    filepath TEXT NOT NULL UNIQUE,
+                    year TEXT,
+                    month TEXT
+                )
+            """)
+            # --- FIN DE LO NUEVO ---
+
             # 2. Tabla FACES (Datos de reconocimiento)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS faces (
@@ -53,6 +66,7 @@ class VisageVaultDB:
                     photo_id INTEGER NOT NULL,
                     encoding BLOB NOT NULL,
                     location TEXT,
+                    is_deleted INTEGER DEFAULT 0,
                     FOREIGN KEY (photo_id) REFERENCES photos (id)
                 )
             """)
@@ -103,10 +117,28 @@ class VisageVaultDB:
             cursor.execute("SELECT filepath, year, month FROM photos")
             return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
         except sqlite3.Error as e:
-            print(f"Error al cargar fechas de la BD: {e}")
+            print(f"Error al cargar fechas de FOTOS de la BD: {e}")
             return {}
         finally:
             conn.close()
+
+    # --- ¡NUEVA FUNCIÓN! ---
+    def load_all_video_dates(self) -> dict:
+        """
+        Carga todas las rutas de VÍDEO, años y meses conocidos desde la BD.
+        Devuelve: {'/ruta/video1.mp4': ('2025', '08'), ...}
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT filepath, year, month FROM videos")
+            return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
+        except sqlite3.Error as e:
+            print(f"Error al cargar fechas de VÍDEOS de la BD: {e}")
+            return {}
+        finally:
+            conn.close()
+    # --- FIN DE LO NUEVO ---
 
     def bulk_upsert_photos(self, photos_data: list[tuple[str, str, str]]):
         """
@@ -125,6 +157,58 @@ class VisageVaultDB:
             print(f"Error en bulk_upsert_photos: {e}")
         finally:
             conn.close()
+
+    # --- ¡NUEVA FUNCIÓN! ---
+    def bulk_upsert_videos(self, videos_data: list[tuple[str, str, str]]):
+        """
+        Inserta o reemplaza una lista de vídeos con su año y mes.
+        (videos_data es una lista de tuplas: (filepath, year, month))
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT OR REPLACE INTO videos (filepath, year, month)
+                VALUES (?, ?, ?)
+            """, videos_data)
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en bulk_upsert_videos: {e}")
+        finally:
+            conn.close()
+    # --- FIN DE LO NUEVO ---
+
+    # --- ¡NUEVA FUNCIÓN! ---
+    def bulk_delete_photos(self, filepaths: list[str]):
+        """Elimina una lista de fotos de la BD."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            # Prepara los datos como una lista de tuplas para executemany
+            data = [(path,) for path in filepaths]
+            cursor.executemany("DELETE FROM photos WHERE filepath = ?", data)
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en bulk_delete_photos: {e}")
+        finally:
+            conn.close()
+    # --- FIN DE LO NUEVO ---
+
+    # --- ¡NUEVA FUNCIÓN! ---
+    def bulk_delete_videos(self, filepaths: list[str]):
+        """Elimina una lista de vídeos de la BD."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            data = [(path,) for path in filepaths]
+            cursor.executemany("DELETE FROM videos WHERE filepath = ?", data)
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error en bulk_delete_videos: {e}")
+        finally:
+            conn.close()
+    # --- FIN DE LO NUEVO ---
+
 
     # --- Funciones de Edición (Usadas por PhotoDetailDialog) ---
 
@@ -297,9 +381,6 @@ class VisageVaultDB:
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-
-            # --- MODIFICACIÓN ---
-            # Seleccionamos 'DISTINCT' y añadimos 'f.is_deleted = 0'
             cursor.execute("""
                 SELECT DISTINCT p.filepath, p.year, p.month
                 FROM photos p
@@ -308,8 +389,6 @@ class VisageVaultDB:
                 WHERE fl.person_id = ? AND f.is_deleted = 0
                 ORDER BY p.year DESC, p.month DESC
             """, (person_id,))
-            # --- FIN DE MODIFICACIÓN ---
-
             return cursor.fetchall() # Devuelve una lista de filas (dict-like)
         finally:
             conn.close()
@@ -418,8 +497,11 @@ class VisageVaultDB:
 if __name__ == "__main__":
     # Ejemplo de uso:
     db = VisageVaultDB(db_file="test_visagevault.db")
-    print("\nPrueba de carga:")
+    print("\nPrueba de carga de fotos:")
     print(db.load_all_photo_dates())
+
+    print("\nPrueba de carga de vídeos:")
+    print(db.load_all_video_dates())
 
     # Pruebas de inserción
     test_data = [

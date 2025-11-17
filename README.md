@@ -1,4 +1,8 @@
+Aquí tienes el archivo `README.md` actualizado.
 
+He modificado la descripción, la lista de características y, lo más importante, la sección de **Requisitos** para incluir las nuevas dependencias (como `opencv` y `ffmpeg`) que necesita la función de vídeo.
+
+Puedes copiar y pegar este contenido directamente en tu archivo `README.md`.
 
 -----
 
@@ -7,41 +11,42 @@
 [](https://www.google.com/search?q=https://github.com/danitxu79/VisageVault)
 [](https://www.google.com/search?q=LICENSE)
 
-VisageVault es una aplicación de escritorio para macOS, Windows y Linux, diseñada para organizar y explorar grandes colecciones de fotos. Su característica principal es el **reconocimiento facial**, que permite escanear, agrupar y etiquetar personas automáticamente en tu biblioteca.
+VisageVault es una aplicación de escritorio para macOS, Windows y Linux, diseñada para organizar y explorar grandes colecciones de fotos **y vídeos**. Su característica principal es el **reconocimiento facial** (en fotos), que permite escanear, agrupar y etiquetar personas automáticamente en tu biblioteca.
 
 ## ✨ Características Principales
 
-  * **Escaneo de Directorios:** Analiza recursivamente tu carpeta de fotos para encontrar todas las imágenes (`.jpg`, `.png`, `.webp`, etc.).
-  * **Organización por Fecha:** Agrupa automáticamente las fotos por Año y Mes, leyendo los metadatos EXIF o la fecha de archivo.
-  * **Detección de Caras:** Utiliza `face_recognition` para escanear cada foto y detectar todas las caras presentes.
+  * **Escaneo de Directorios:** Analiza recursivamente tu carpeta de medios para encontrar todas las imágenes (`.jpg`, `.png`, etc.) **y vídeos** (`.mp4`, `.mkv`, `.mov`, etc.).
+  * **Organización por Fecha:** Agrupa automáticamente las fotos y vídeos por Año y Mes, leyendo los metadatos EXIF o la fecha de archivo.
+  * **Soporte de Vídeo Dedicado:** Una pestaña separada para navegar por tus vídeos, con generación de miniaturas (usando OpenCV) y reproducción mediante doble clic (abre el reproductor predeterminado del sistema).
+  * **Detección de Caras (en Fotos):** Utiliza `face_recognition` para escanear cada foto y detectar todas las caras presentes.
   * **Agrupamiento (Clustering):** Compara todas las caras "Desconocidas" y las agrupa (usando `sklearn.cluster.DBSCAN`) para sugerir personas que son la misma.
   * **Etiquetado Sencillo:** Una interfaz dedicada para revisar las caras agrupadas y asignarles un nombre.
   * **Navegación por Persona:** Una vez etiquetadas, puedes ver todas las fotos en las que aparece una persona específica.
   * **Gestión de Metadatos:** Permite editar la fecha (Año/Mes) de las fotos si los metadatos son incorrectos.
-  * **Caché de Miniaturas:** Genera y almacena miniaturas para una carga y navegación ultra rápidas.
+  * **Caché de Miniaturas:** Genera y almacena miniaturas para fotos y vídeos para una carga y navegación ultra rápidas.
 
 -----
 
 ## 🛠️ Requisitos
 
-Para ejecutar VisageVault desde el código fuente, necesitarás Python 3.11+ y varias dependencias del sistema para compilar los módulos de reconocimiento facial.
+Para ejecutar VisageVault desde el código fuente, necesitarás Python 3.11+ y varias dependencias del sistema.
 
 ### 1\. Dependencias del Sistema
 
-La librería `face_recognition` (y su dependencia `dlib`) necesita compilar código C++ durante la instalación. Asegúrate de tener un compilador de C++ y las herramientas de desarrollo necesarias:
+Las librerías de Python necesitan compilar código C++ y acceder a códecs de vídeo.
 
   * **En Debian/Ubuntu:**
     ```bash
-    sudo apt install build-essential cmake libopenblas-dev liblapack-dev
+    sudo apt install build-essential cmake libopenblas-dev liblapack-dev ffmpeg
     ```
   * **En Arch/Manjaro:**
     ```bash
-    sudo pacman -S base-devel cmake openblas lapack
+    sudo pacman -S base-devel cmake openblas lapack ffmpeg
     ```
   * **En Fedora:**
     ```bash
     sudo dnf groupinstall "Development Tools"
-    sudo dnf install cmake openblas-devel lapack-devel
+    sudo dnf install cmake openblas-devel lapack-devel ffmpeg
     ```
 
 ### 2\. Dependencias de Python
@@ -51,8 +56,9 @@ Todos los paquetes de Python necesarios están listados en `requirements.txt`. L
   * `PySide6` (Para la interfaz gráfica Qt 6)
   * `face_recognition` (Para la detección de caras)
   * `scikit-learn` (Para el clustering de caras)
-  * `Pillow` (Para el manejo de imágenes y miniaturas)
+  * `Pillow` (Para el manejo de imágenes)
   * `piexif` (Para leer y escribir metadatos EXIF)
+  * **`opencv-python-headless` (¡Nuevo\! Para la generación de miniaturas de vídeo)**
 
 -----
 
@@ -67,7 +73,7 @@ Todos los paquetes de Python necesarios están listados en `requirements.txt`. L
 
 2.  **Instala las Dependencias del Sistema:**
 
-      * Asegúrate de haber instalado las herramientas de compilación (`cmake`, `build-essential`, etc.) mencionadas en la sección "Requisitos".
+      * Asegúrate de haber instalado las herramientas de compilación (`cmake`, `ffmpeg`, etc.) mencionadas en la sección "Requisitos".
 
 3.  **Crea un entorno virtual:**
 
@@ -100,7 +106,7 @@ source venv/bin/activate
 python visagevault.py
 ```
 
-La primera vez que la ejecutes, te pedirá que selecciones el directorio raíz que contiene tus fotos.
+La primera vez que la ejecutes, te pedirá que selecciones el directorio raíz que contiene tus fotos y vídeos.
 
 -----
 

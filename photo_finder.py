@@ -5,6 +5,10 @@ import time
 # --- CONFIGURACIÓN DE EXTENSIONES A BUSCAR ---
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tiff', '.webp')
 
+VIDEO_EXTENSIONS = (
+    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg'
+)
+
 def find_photos(directory_path: str) -> list[str]:
     """
     Busca archivos de imagen en un directorio dado (recursivamente).
@@ -12,29 +16,46 @@ def find_photos(directory_path: str) -> list[str]:
     """
     target_dir = Path(directory_path)
     if not target_dir.is_dir():
-        # Si la ruta no existe o no es un directorio, devolvemos lista vacía
         return []
 
     photo_files = []
-
     count = 0
-    # **.rglob('*')** busca recursivamente todos los archivos
+
     for file_path in target_dir.rglob('*'):
-        # Comprobamos si es un archivo y si su extensión es compatible
         if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
-            # Convertimos Path a string para fácil manejo
             photo_files.append(str(file_path))
 
-        # --- SIMULACIÓN DE TRABAJO PESADO ---
-        # Esto asegura que podemos probar la fluidez del threading
         count += 1
         if count % 100 == 0:
              time.sleep(0.001)
-        # ------------------------------------
 
     return photo_files
 
+def find_videos(directory_path: str) -> list[str]:
+    """
+    Busca archivos de vídeo en un directorio dado (recursivamente).
+    Devuelve las rutas como una lista de strings.
+    """
+    target_dir = Path(directory_path)
+    if not target_dir.is_dir():
+        return []
+
+    video_files = []
+    count = 0
+
+    for file_path in target_dir.rglob('*'):
+        # Comprobar si es un archivo y si su extensión es de VÍDEO
+        if file_path.is_file() and file_path.suffix.lower() in VIDEO_EXTENSIONS:
+            video_files.append(str(file_path))
+
+        count += 1
+        if count % 100 == 0:
+             time.sleep(0.001)
+
+    return video_files
+
 if __name__ == "__main__":
+    # ... (el main no necesita cambios) ...
     # Ejemplo de prueba rápida (si tienes una carpeta de imágenes)
     test_dir = Path.home() / "Imágenes"
     print(f"Buscando en: {test_dir}")

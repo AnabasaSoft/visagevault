@@ -5,6 +5,8 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 from datetime import datetime
 from pathlib import Path
+from datetime import datetime
+from pathlib import Path
 
 def get_photo_date(filepath: str) -> tuple[str, str]:
     """
@@ -72,3 +74,17 @@ def save_exif_dict(filepath: str, exif_dict: dict):
         print(f"Metadatos guardados en: {filepath}")
     except Exception as e:
         print(f"Error al guardar metadatos en {filepath}: {e}")
+
+def get_video_date(filepath: str) -> tuple[str, str]:
+    """
+    Determina la fecha de un vídeo.
+    Por ahora, solo usa la fecha de modificación del archivo.
+    Devuelve una tupla (año, mes) o ("Sin Fecha", "00").
+    """
+    try:
+        # Usar fecha de modificación del archivo
+        stat = Path(filepath).stat()
+        dt_mod = datetime.fromtimestamp(stat.st_mtime)
+        return str(dt_mod.year), f"{dt_mod.month:02d}"
+    except Exception:
+        return "Sin Fecha", "00"
