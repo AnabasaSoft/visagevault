@@ -151,6 +151,3 @@ Este proyecto se ofrece bajo un modelo de **Doble Licencia (Dual License)**:
 2.  **Comercial (Privativa):** Si los términos de la LGPLv3 no se ajustan a tus necesidades (por ejemplo, para software propietario de código cerrado), por favor contacta al autor para adquirir una licencia comercial.
 
 Para más detalles, consulta el archivo `LICENSE` o la cabecera de `visagevault.py`.
-
-```
-```

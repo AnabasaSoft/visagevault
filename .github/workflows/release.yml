@@ -1,0 +1,121 @@
+name: Build and Release VisageVault
+
+on:
+  push:
+    tags:
+      - 'v*' # Disparar solo cuando se crea un tag que comienza con 'v' (ej., v1.2.0)
+
+jobs:
+  # ========================================================
+  # JOB 1: Windows Executable (.exe)
+  # ========================================================
+  build_windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' # Usar una versión de Python compatible con las dependencias
+
+    - name: Install Dependencies
+      # Instalar dependencias, incluyendo las complejas como face_recognition
+      run: pip install -r requirements.txt
+
+    - name: Build with PyInstaller
+      # Compilación de un solo archivo ejecutable y silencioso (windowed)
+      run: |
+        pip install pyinstaller
+        pyinstaller --onefile --windowed --name VisageVault visagevault.py
+
+    - name: Upload Windows Asset
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: dist/VisageVault.exe
+        name: ${{ github.ref_name }}
+        tag_name: ${{ github.ref_name }}
+
+  # ========================================================
+  # JOB 2: macOS Application (.app)
+  # ========================================================
+  build_macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      run: pip install -r requirements.txt
+
+    - name: Build with PyInstaller
+      # PyInstaller crea el paquete .app o un ejecutable binario
+      run: |
+        pip install pyinstaller
+        pyinstaller --onefile --windowed --name VisageVault visagevault.py
+
+    - name: Prepare macOS Asset (Renombrar el ejecutable principal)
+      # Nota: PyInstaller crea 'VisageVault' en dist/. Podrías crear un .dmg si es necesario.
+      run: mv dist/VisageVault dist/VisageVault-macos
+
+    - name: Upload macOS Asset
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: dist/VisageVault-macos
+
+  # ========================================================
+  # JOB 3: Linux Packages (AppImage, DEB, RPM)
+  # ========================================================
+  build_linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install System Dependencies & fpm (Crucial para RAW, Packaging y ffmpeg)
+      run: |
+        sudo apt update
+        # Instalar dependencias de compilación y rawpy/ffmpeg
+        sudo apt install -y build-essential cmake libopenblas-dev liblapack-dev ffmpeg
+        # Instalar Ruby y fpm (para .deb/.rpm)
+        sudo apt install -y ruby ruby-dev
+        sudo gem install fpm
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python Dependencies
+      run: pip install -r requirements.txt
+
+    - name: Build PyInstaller Executable (Preparación para AppImage y fpm)
+      run: |
+        pip install pyinstaller
+        pyinstaller --onefile --name VisageVault visagevault.py
+
+    - name: Run AppImage Creation Script
+      # Tu script compila.sh debe usar el ejecutable en dist/ para crear VisageVault.AppImage
+      run: |
+        chmod +x compila.sh
+        ./compila.sh
+
+    - name: Run DEB/RPM Packaging Script
+      # Tu script pack_linux.sh debe usar el ejecutable en dist/ para generar .deb y .rpm
+      run: |
+        chmod +x pack_linux.sh
+        ./pack_linux.sh ${{ github.ref_name }} # Pasa la versión del tag
+
+    - name: Upload Linux Assets
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+          *.AppImage
+          *.deb
+          *.rpm
