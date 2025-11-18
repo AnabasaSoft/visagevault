@@ -33,17 +33,21 @@ jobs:
             --name VisageVault ^
             --add-data="visagevault.png;." ^
             --collect-data face_recognition_models ^
+            --collect-all=rawpy ^  # Asegura binarios de RAW
+            --hidden-import=piexif ^ # Asegura import de EXIF
             --hidden-import=numpy ^
             --hidden-import=sklearn ^
             --hidden-import=scipy._cyutility ^
             --hidden-import=sklearn._cyutility ^
             visagevault.py
 
-      - name: 5. Subir el ejecutable de Windows
-        uses: actions/upload-artifact@v4
+      - name: 5. Subir el ejecutable a la Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: VisageVault-Windows.exe
-          path: dist/VisageVault.exe
+          files: dist/VisageVault.exe
+          tag_name: ${{ github.event.release.tag_name }}
+          # Usamos github.event.release.tag_name que contiene el tag (ej. v1.2.0)
+          # draft: true  # Descomentar si quieres que la release se quede en borrador
 
   # ========================================================
   # TAREA 2: CONSTRUIR EL .DMG PARA MACOS
@@ -72,6 +76,8 @@ jobs:
             --name VisageVault \
             --add-data="visagevault.png:." \
             --collect-data face_recognition_models \
+            --collect-all=rawpy \
+            --hidden-import=piexif \
             --hidden-import=numpy \
             --hidden-import=sklearn \
             --hidden-import=scipy._cyutility \
@@ -79,13 +85,15 @@ jobs:
             visagevault.py
 
       - name: 5. Crear el .dmg (Imagen de Disco)
+        # Asume que PyInstaller creó VisageVault.app dentro de dist/
         run: create-dmg "dist/VisageVault.app"
 
-      - name: 6. Subir el .dmg de macOS
-        uses: actions/upload-artifact@v4
+      - name: 6. Subir el .dmg a la Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: VisageVault-macOS.dmg
-          path: VisageVault*.dmg # El nombre puede variar ligeramente
+          files: VisageVault*.dmg
+          tag_name: ${{ github.event.release.tag_name }}
+          # draft: true
 
   # ========================================================
   # TAREA 3: CONSTRUIR PAQUETES DE LINUX (AppImage, .deb, .rpm, .pkg)
@@ -106,117 +114,97 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev \
             ffmpeg qt6-base-dev ruby-dev
+          sudo gem install fpm
 
-      - name: 4. Instalar FPM (para .deb/.rpm/.pkg)
-        run: sudo gem install fpm
-
-      - name: 5. Subir el ejecutable a la Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/VisageVault.exe
-          tag_name: ${{ github.event.release.tag_name }}
-          draft: true # Deja el draft en true por seguridad
-
-      - name: 6. Subir el .dmg a la Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: VisageVault*.dmg
-          tag_name: ${{ github.event.release.tag_name }}
-          draft: true
-
-      - name: 7. Ejecutar PyInstaller (para Linux, modo --onedir)
-        # Usamos --onedir porque es necesario para linuxdeploy y fpm
+      - name: 4. Descargar linuxdeploy
         run: |
+          wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+      - name: 5. Instalar dependencias de Python
+        run: pip install -r requirements.txt
+
+      - name: 6. Ejecutar PyInstaller (para Linux, modo --onedir)
+        run: |
+          pip install pyinstaller
           pyinstaller --noconfirm \
             --onedir \
             --windowed \
             --name VisageVault \
             --add-data="visagevault.png:." \
             --collect-data face_recognition_models \
+            --collect-all=rawpy \
+            --hidden-import=piexif \
             --hidden-import=numpy \
             --hidden-import=sklearn \
             --hidden-import=scipy._cyutility \
             --hidden-import=sklearn._cyutility \
             visagevault.py
 
-      - name: 8. Crear AppDir y .desktop
+      - name: 7. Crear AppDir y .desktop
+        # Este paso es necesario para AppImage y fpm.
         run: |
           mkdir -p AppDir/usr/bin
           cp -r dist/VisageVault/* AppDir/usr/bin/
           cp visagevault.png AppDir/
+
+          # Crear .desktop file
           cat << EOF > AppDir/visagevault.desktop
           [Desktop Entry]
           Name=VisageVault
           Comment=Gestor de Fotografías Inteligente
-          Exec=VisageVault
+          Exec=usr/bin/VisageVault
           Icon=visagevault
           Type=Application
           Categories=Graphics;Photography;
           EOF
 
-      - name: 9. Ejecutar linuxdeploy (para .AppImage)
+      - name: 8. Ejecutar linuxdeploy (para .AppImage)
         run: |
           ./linuxdeploy-x86_64.AppImage --appdir AppDir \
             --desktop-file AppDir/visagevault.desktop \
             --icon-file AppDir/visagevault.png \
             --output appimage
 
-      - name: 10. Subir la AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: VisageVault-Linux.AppImage
-          path: VisageVault-x86_64.AppImage
-
-      - name: 11. Crear paquete .deb (Debian/Ubuntu)
+      - name: 9. Crear paquetes DEB/RPM/PKG (Usando fpm)
+        # Creamos los paquetes a partir del directorio AppDir/usr/bin/
         run: |
-          fpm -s dir -t deb -n visagevault -v 1.0 \
+          VERSION_TAG=$(echo ${{ github.event.release.tag_name }} | sed 's/v//')
+
+          # 9a. DEBIAN (.deb)
+          fpm -s dir -t deb -n visagevault -v $VERSION_TAG \
             --architecture amd64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
-            --depends python3 \
-            AppDir/usr/bin/=/usr/lib/VisageVault \
-            AppDir/visagevault.png=/usr/share/icons/hicolor/256x256/apps/visagevault.png \
-            AppDir/visagevault.desktop=/usr/share/applications/visagevault.desktop
+            -C AppDir \
+            --prefix "/"
 
-      - name: 12. Subir el .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: VisageVault-Linux.deb
-          path: "*.deb"
-
-      - name: 13. Crear paquete .rpm (Fedora)
-        run: |
-          fpm -s dir -t rpm -n visagevault -v 1.0 \
+          # 9b. RPM (Fedora)
+          fpm -s dir -t rpm -n visagevault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
-            --depends python3 \
-            AppDir/usr/bin/=/usr/lib/VisageVault \
-            AppDir/visagevault.png=/usr/share/icons/hicolor/256x256/apps/visagevault.png \
-            AppDir/visagevault.desktop=/usr/share/applications/visagevault.desktop
+            -C AppDir \
+            --prefix "/"
 
-      - name: 14. Subir el .rpm
-        uses: actions/upload-artifact@v4
-        with:
-          name: VisageVault-Linux.rpm
-          path: "*.rpm"
-
-      - name: 15. Crear paquete .pkg.tar.zst (Arch/Manjaro)
-        run: |
-          fpm -s dir -t pacman -n visagevault -v 1.0 \
+          # 9c. PACMAN (.pkg.tar.zst para Arch/Manjaro)
+          fpm -s dir -t pacman -n visagevault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
-            --depends python \
-            AppDir/usr/bin/=/usr/lib/VisageVault \
-            AppDir/visagevault.png=/usr/share/icons/hicolor/256x256/apps/visagevault.png \
-            AppDir/visagevault.desktop=/usr/share/applications/visagevault.desktop
+            -C AppDir \
+            --prefix "/"
 
-      - name: 16. Subir el .pkg.tar.zst
-        uses: actions/upload-artifact@v4
+      - name: 10. Subir todos los Assets de Linux a la Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: VisageVault-Linux.pkg.tar.zst
-          path: "*.pkg.tar.zst"
+          files: |
+            *.AppImage
+            *.deb
+            *.rpm
+            *.pkg.tar.zst
+          tag_name: ${{ github.event.release.tag_name }}
+          # draft: true
