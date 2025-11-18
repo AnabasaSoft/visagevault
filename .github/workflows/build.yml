@@ -33,8 +33,8 @@ jobs:
             --name VisageVault ^
             --add-data="visagevault.png;." ^
             --collect-data face_recognition_models ^
-            --collect-all=rawpy ^  # Asegura binarios de RAW
-            --hidden-import=piexif ^ # Asegura import de EXIF
+            --collect-all=rawpy ^
+            --hidden-import=piexif ^
             --hidden-import=numpy ^
             --hidden-import=sklearn ^
             --hidden-import=scipy._cyutility ^
@@ -46,8 +46,8 @@ jobs:
         with:
           files: dist/VisageVault.exe
           tag_name: ${{ github.event.release.tag_name }}
-          # Usamos github.event.release.tag_name que contiene el tag (ej. v1.2.0)
-          # draft: true  # Descomentar si quieres que la release se quede en borrador
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
 
   # ========================================================
   # TAREA 2: CONSTRUIR EL .DMG PARA MACOS
@@ -93,7 +93,8 @@ jobs:
         with:
           files: VisageVault*.dmg
           tag_name: ${{ github.event.release.tag_name }}
-          # draft: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
 
   # ========================================================
   # TAREA 3: CONSTRUIR PAQUETES DE LINUX (AppImage, .deb, .rpm, .pkg)
@@ -207,4 +208,5 @@ jobs:
             *.rpm
             *.pkg.tar.zst
           tag_name: ${{ github.event.release.tag_name }}
-          # draft: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
