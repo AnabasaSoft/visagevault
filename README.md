@@ -23,14 +23,14 @@ Esta versión se centra en el rendimiento, la comodidad y la edición rápida:
 * **👁️ Corrección de Ojos Rojos:** Nueva herramienta en el menú contextual (clic derecho) 
     para detectar y corregir ojos rojos en tus fotos automáticamente.
 * **⚡ Rendimiento en Personas:** Implementado un sistema de **caché de caras en disco**. 
-    La primera vez detecta las caras, pero las siguientes veces la carga de la pestaña "Personas" 
-    es instantánea, incluso con archivos RAW pesados.
+    La primera vez detecta las caras, pero las siguientes veces la carga de la pestaña 
+    "Personas" es instantánea, incluso con archivos RAW pesados.
 * **Soporte RAW Avanzado:** Visualización, carga de miniaturas y reconocimiento facial en 
     archivos RAW comunes (.NEF, .CR2, .ARW, etc.) gracias a `rawpy`.
-* **Gestión de Metadatos Persistente:** Opción de **Cambiar Fecha (Mover)** que guarda el cambio 
-    en el archivo físico (EXIF para JPG, fecha de modificación para Vídeos/RAW).
-* **Gestión de Visibilidad:** Opción para **Ocultar/Restaurar** archivos de la vista principal y 
-    **Eliminar** archivos físicamente del disco.
+* **Gestión de Metadatos Persistente:** Opción de **Cambiar Fecha (Mover)** que guarda el 
+  cambio en el archivo físico (EXIF para JPG, fecha de modificación para Vídeos/RAW).
+* **Gestión de Visibilidad:** Opción para **Ocultar/Restaurar** archivos de la vista 
+  principal y **Eliminar** archivos físicamente del disco.
 * **Selección Robusta:** Selección de rango con **Shift + Clic**, selección múltiple con 
     **Ctrl + Clic**, y selección por arrastre.
 
@@ -40,11 +40,11 @@ Esta versión se centra en el rendimiento, la comodidad y la edición rápida:
 
 Este proyecto se ofrece bajo un modelo de **Doble Licencia (Dual License)**:
 
-1.  **LGPLv3:** Ideal para proyectos de código abierto. Si usas esta biblioteca (especialmente si 
-  la modificas), debes cumplir con las obligaciones de la LGPLv3.
-2.  **Comercial (Privativa):** Si los términos de la LGPLv3 no se ajustan a tus necesidades (por 
-  ejemplo, para software propietario de código cerrado), por favor contacta al autor para adquirir 
-  una licencia comercial.
+1.  **LGPLv3:** Ideal para proyectos de código abierto. Si usas esta biblioteca (especialmente 
+  si la modificas), debes cumplir con las obligaciones de la LGPLv3.
+2.  **Comercial (Privativa):** Si los términos de la LGPLv3 no se ajustan a tus necesidades 
+  (por ejemplo, para software propietario de código cerrado), por favor contacta al autor para 
+  adquirir una licencia comercial.
 
 Para más detalles, consulta el archivo `LICENSE` o la cabecera de `visagevault.py`.
 
