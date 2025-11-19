@@ -1,6 +1,5 @@
 name: Build VisageVault Releases
 
-# Se activa cuando creas un "Release" en GitHub
 on:
   release:
     types: [created]
@@ -11,37 +10,40 @@ jobs:
   # ========================================================
   build-windows:
     runs-on: windows-latest
+    # Usar bash para evitar problemas con los caracteres de escape de PowerShell
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: 1. Descargar el código fuente
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 2. Configurar Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 3. Instalar dependencias de Python
+      - name: Instalar dependencias
         run: |
           pip install -r requirements.txt
           pip install pyinstaller cmake
 
-      - name: 4. Ejecutar PyInstaller (para Windows .exe)
+      - name: Construir .exe con PyInstaller
+        # Usamos \ para salto de linea en bash
         run: |
-          pyinstaller --noconfirm ^
-            --onefile ^
-            --windowed ^
-            --name VisageVault ^
-            --add-data="visagevault.png;." ^
-            --collect-data face_recognition_models ^
-            --collect-all=rawpy ^
-            --hidden-import=piexif ^
-            --hidden-import=numpy ^
-            --hidden-import=sklearn ^
-            --hidden-import=scipy._cyutility ^
-            --hidden-import=sklearn._cyutility ^
+          pyinstaller --noconfirm \
+            --onefile \
+            --windowed \
+            --name "VisageVault" \
+            --add-data "visagevault.png;." \
+            --collect-data face_recognition_models \
+            --collect-all rawpy \
+            --hidden-import piexif \
+            --hidden-import numpy \
+            --hidden-import sklearn \
+            --hidden-import scipy._cyutility \
+            --hidden-import sklearn._cyutility \
             visagevault.py
 
-      - name: 5. Subir el ejecutable a la Release
+      - name: Subir Windows Asset
         uses: softprops/action-gh-release@v1
         with:
           files: dist/VisageVault.exe
@@ -55,151 +57,182 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - name: 1. Descargar el código fuente
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 2. Configurar Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 3. Instalar dependencias de Python
+      - name: Instalar dependencias (Python y Sistema)
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller cmake create-dmg
+          pip install pyinstaller cmake
+          # Instalar create-dmg con Homebrew, no con pip
+          brew install create-dmg
 
-      - name: 4. Ejecutar PyInstaller (para macOS .app)
+      - name: Construir .app con PyInstaller
         run: |
           pyinstaller --noconfirm \
             --onedir \
             --windowed \
-            --name VisageVault \
-            --add-data="visagevault.png:." \
+            --name "VisageVault" \
+            --add-data "visagevault.png:." \
             --collect-data face_recognition_models \
-            --collect-all=rawpy \
-            --hidden-import=piexif \
-            --hidden-import=numpy \
-            --hidden-import=sklearn \
-            --hidden-import=scipy._cyutility \
-            --hidden-import=sklearn._cyutility \
+            --collect-all rawpy \
+            --hidden-import piexif \
+            --hidden-import numpy \
+            --hidden-import sklearn \
+            --hidden-import scipy._cyutility \
+            --hidden-import sklearn._cyutility \
             visagevault.py
 
-      - name: 5. Crear el .dmg (Imagen de Disco)
-        # Asume que PyInstaller creó VisageVault.app dentro de dist/
-        run: create-dmg "dist/VisageVault.app"
+      - name: Crear .dmg
+        # create-dmg requiere la ruta al .app generado en dist/
+        run: |
+          # Asegurar que el directorio dist existe y contiene la app
+          ls -R dist/
+          create-dmg \
+            --volname "VisageVault Installer" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "VisageVault.app" 200 190 \
+            --hide-extension "VisageVault.app" \
+            --app-drop-link 600 185 \
+            "VisageVault-macOS.dmg" \
+            "dist/VisageVault.app"
 
-      - name: 6. Subir el .dmg a la Release
+      - name: Subir macOS Asset
         uses: softprops/action-gh-release@v1
         with:
-          files: VisageVault*.dmg
+          files: VisageVault-macOS.dmg
           tag_name: ${{ github.event.release.tag_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: false
 
   # ========================================================
-  # TAREA 3: CONSTRUIR PAQUETES DE LINUX (AppImage, .deb, .rpm, .pkg)
+  # TAREA 3: CONSTRUIR PAQUETES DE LINUX
   # ========================================================
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Descargar el código fuente
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 2. Configurar Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 3. Instalar dependencias del sistema (dev, qt, ffmpeg, fpm)
+      - name: Instalar dependencias del sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev \
             ffmpeg qt6-base-dev ruby-dev
           sudo gem install fpm
 
-      - name: 4. Descargar linuxdeploy
+      - name: Configurar linuxdeploy
         run: |
           wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
 
-      - name: 5. Instalar dependencias de Python
+      - name: Instalar dependencias Python
         run: pip install -r requirements.txt
 
-      - name: 6. Ejecutar PyInstaller (para Linux, modo --onedir)
+      - name: Construir binario con PyInstaller
         run: |
           pip install pyinstaller
           pyinstaller --noconfirm \
             --onedir \
             --windowed \
-            --name VisageVault \
-            --add-data="visagevault.png:." \
+            --name "VisageVault" \
+            --add-data "visagevault.png:." \
             --collect-data face_recognition_models \
-            --collect-all=rawpy \
-            --hidden-import=piexif \
-            --hidden-import=numpy \
-            --hidden-import=sklearn \
-            --hidden-import=scipy._cyutility \
-            --hidden-import=sklearn._cyutility \
+            --collect-all rawpy \
+            --hidden-import piexif \
+            --hidden-import numpy \
+            --hidden-import sklearn \
+            --hidden-import scipy._cyutility \
+            --hidden-import sklearn._cyutility \
             visagevault.py
 
-      - name: 7. Crear AppDir y .desktop
-        # Este paso es necesario para AppImage y fpm.
+      - name: Empaquetar AppDir
         run: |
+          # Crear estructura
           mkdir -p AppDir/usr/bin
-          cp -r dist/VisageVault/* AppDir/usr/bin/
-          cp visagevault.png AppDir/
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          # Crear .desktop file
-          cat << EOF > AppDir/visagevault.desktop
+          # Copiar binarios (todo el contenido de dist/VisageVault)
+          cp -r dist/VisageVault/* AppDir/usr/bin/
+
+          # Asegurar permisos de ejecución
+          chmod +x AppDir/usr/bin/VisageVault
+
+          # Copiar icono
+          cp visagevault.png AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png
+          cp visagevault.png AppDir/visagevault.png
+
+          # Crear .desktop
+          cat << EOF > AppDir/usr/share/applications/visagevault.desktop
           [Desktop Entry]
           Name=VisageVault
-          Comment=Gestor de Fotografías Inteligente
-          Exec=usr/bin/VisageVault
+          Comment=Gestor de Fotografias Inteligente
+          Exec=VisageVault
           Icon=visagevault
           Type=Application
           Categories=Graphics;Photography;
+          Terminal=false
           EOF
 
-      - name: 8. Ejecutar linuxdeploy (para .AppImage)
+          # Copia también en raiz para linuxdeploy (por si acaso)
+          cp AppDir/usr/share/applications/visagevault.desktop AppDir/
+
+      - name: Generar AppImage
         run: |
-          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
-            --desktop-file AppDir/visagevault.desktop \
-            --icon-file AppDir/visagevault.png \
+          # Forzar el entorno para que linuxdeploy encuentre el ejecutable
+          export LINUXDEPLOY_OUTPUT_VERSION="${{ github.event.release.tag_name }}"
+
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/VisageVault \
+            --desktop-file AppDir/usr/share/applications/visagevault.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png \
             --output appimage
 
-      - name: 9. Crear paquetes DEB/RPM/PKG (Usando fpm)
-        # Creamos los paquetes a partir del directorio AppDir/usr/bin/
+      - name: Generar paquetes DEB/RPM/PKG
         run: |
           VERSION_TAG=$(echo ${{ github.event.release.tag_name }} | sed 's/v//')
 
-          # 9a. DEBIAN (.deb)
+          # DEB
           fpm -s dir -t deb -n visagevault -v $VERSION_TAG \
             --architecture amd64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
+            --depends python3 \
             -C AppDir \
             --prefix "/"
 
-          # 9b. RPM (Fedora)
+          # RPM
           fpm -s dir -t rpm -n visagevault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
+            --depends python3 \
             -C AppDir \
             --prefix "/"
 
-          # 9c. PACMAN (.pkg.tar.zst para Arch/Manjaro)
+          # PACMAN
           fpm -s dir -t pacman -n visagevault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Vídeos Inteligente" \
             --maintainer "Daniel Serrano" \
             --url "https://github.com/danitxu79/VisageVault" \
+            --depends python \
             -C AppDir \
             --prefix "/"
 
-      - name: 10. Subir todos los Assets de Linux a la Release
+      - name: Subir Linux Assets
         uses: softprops/action-gh-release@v1
         with:
           files: |
