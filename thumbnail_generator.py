@@ -7,7 +7,7 @@ import cv2
 import rawpy # <-- NUEVO
 
 THUMBNAIL_SIZE = (128, 128)
-THUMBNAIL_DIR = Path(".visagevault_cache/thumbnails")
+THUMBNAIL_DIR = Path("visagevault_cache") / "local_snapshot_cache"
 
 def get_thumbnail_path(original_filepath: str) -> Path:
     """Genera la ruta donde se guardará la miniatura."""

@@ -42,3 +42,14 @@ def set_thumbnail_size(size):
     config = load_config()
     config['thumbnail_size'] = size
     save_config(config)
+
+def get_drive_folder_id():
+    """Obtiene el ID de la carpeta de Drive configurada."""
+    config = load_config()
+    return config.get('drive_folder_id')
+
+def set_drive_folder_id(folder_id):
+    """Guarda el ID de la carpeta de Drive."""
+    config = load_config()
+    config['drive_folder_id'] = folder_id
+    save_config(config)

@@ -5,7 +5,7 @@ venv/
 __pycache__/
 *.pyc
 .python-version
-face_cache/
+visagevault_cache/
 
 # ==================================
 # Artefactos de Build (PyInstaller)
@@ -23,6 +23,7 @@ AppDir/
 *.json
 *.desktop
 *.zip
+*.tar.gz
 
 # ==================================
 # Datos de Runtime de VisageVault

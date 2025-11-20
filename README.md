@@ -1,12 +1,30 @@
+
+
+````markdown
 <p align="center">
   <img src="https://github.com/danitxu79/visagevault/raw/master/visagevault.png" alt="Logo de VisageVault">
 </p>
 
 # 📸 VisageVault
 
-**VisageVault** es un gestor de fotografías y vídeos inteligente, local y privado. Organiza tu 
-colección multimedia por fechas automáticamente y utiliza reconocimiento facial avanzado para 
-agrupar a las personas, permitiéndote etiquetar y encontrar recuerdos rápidamente.
+**VisageVault** es un gestor de fotografías y vídeos inteligente, local, privado y ahora con soporte para **Google Drive**. Organiza tu colección multimedia por fechas automáticamente y utiliza reconocimiento facial avanzado para agrupar a las personas, permitiéndote etiquetar y encontrar recuerdos rápidamente.
+
+---
+
+## ✨ Novedades de la Versión 1.5 (Nube y Optimización)
+
+Esta actualización transforma VisageVault en un gestor híbrido (Local + Nube) y mejora la estructura interna:
+
+* **☁️ Integración con Google Drive:** Nueva pestaña **"Nube"**. Navega por tus copias de seguridad en la nube (incluyendo la sección "Ordenadores" de Google Fotos/Drive) sin descargar todos los archivos.
+* **📅 Organización Temporal en la Nube:** Visualiza tus fotos de Drive organizadas automáticamente por **Año y Mes**, igual que en tu disco local.
+* **🚀 Caché Unificada e Inteligente:** Nuevo sistema de archivos centralizado en `visagevault_cache`.
+    * **Caché de Miniaturas de Drive:** Las miniaturas de la nube se guardan en disco (`drive_snapshot_cache`) para que la carga sea **instantánea** en futuras sesiones y no consuma internet.
+    * **Limpieza Automática:** Sistema de auto-reparación de descargas corruptas.
+* **🔍 Navegación Mejorada:**
+    * **Vista Previa Rápida:** Doble clic para ver fotos (Local y Nube) en pantalla completa.
+    * **Cierre Rápido:** Tecla `ESC` para cerrar vistas previas.
+    * **Filtro de Carpetas Propias:** Algoritmo inteligente para encontrar tu carpeta "Mi Ordenador" en Drive filtrando carpetas compartidas no deseadas.
+* **🖱️ Interacción Unificada:** La selección múltiple, el zoom con `Ctrl`+`Rueda` y la navegación funcionan idéntico en Local y Nube.
 
 ---
 
@@ -63,27 +81,30 @@ La librería `face_recognition` y `rawpy` requieren herramientas de compilación
   ```
 * **Mac:** Xcode command line tools.
 
+----
+
 ### Librerías Python
 
 Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clave son:
 
-* `PySide6` (Interfaz gráfica)
-* `face_recognition` (IA Facial)
-* `scikit-learn` (Clustering de caras)
-* `watchdog` **(Nuevo - Monitorización de archivos)**
-* `rawpy` (Soporte RAW)
-* `opencv-python-headless` (Miniaturas de vídeo y Ojos Rojos)
-* `piexif` (Escritura EXIF)
-* `numpy`, `Pillow`
+  * `PySide6` (Interfaz gráfica)
+  * `face_recognition` (IA Facial)
+  * `scikit-learn` (Clustering de caras)
+  * `watchdog` (Monitorización de archivos)
+  * `rawpy` (Soporte RAW)
+  * `opencv-python-headless` (Miniaturas de vídeo y Ojos Rojos)
+  * `piexif` (Escritura EXIF)
+  * **Google API Client** (NUEVO: `google-api-python-client`, `google-auth-oauthlib`)
+  * `numpy`, `Pillow`, `requests`
 
----
+-----
 
 ## 🚀 Instalación
 
 1.  **Clonar el repositorio:**
 
     ```bash
-    git clone https://github.com/danitxu79/visagevault.git
+    git clone [https://github.com/danitxu79/visagevault.git](https://github.com/danitxu79/visagevault.git)
     cd visagevault
     ```
 
@@ -94,22 +115,26 @@ Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clav
     pip install -r requirements.txt
     ```
 
-3.  **Ejecutar la aplicación:**
+3.  **Configurar Google Drive (Opcional):**
+    Para usar la pestaña Nube, necesitarás un archivo `client_secrets.json` en la raíz del proyecto (obtenido de Google Cloud Console).
+
+4.  **Ejecutar la aplicación:**
 
     ```bash
     python visagevault.py
     ```
 
----
+-----
 
 ## 📖 Guía de Uso Rápida
 
 ### Navegación y Vistas
 
-* **Árbol de Fechas:** Las secciones de **Años/Meses** muestran solo archivos visibles. La sección 
+  * **Árbol de Fechas:** Las secciones de **Años/Meses** muestran solo archivos visibles. La sección
     **Ocultas** muestra los archivos que has archivado y permite Restaurarlos o Eliminarlos.
-* **Auto-Refresco:** Si copias fotos nuevas a tu carpeta vigilada, aparecerán automáticamente en la 
+  * **Auto-Refresco:** Si copias fotos nuevas a tu carpeta vigilada, aparecerán automáticamente en la
     aplicación tras unos segundos.
+  * **Pestaña Nube:** Inicia sesión con Google para explorar tus copias de seguridad. Usa el botón "Cambiar Carpeta" para seleccionar "Mi Ordenador" u otras carpetas de Drive.
 
 ### Menú Contextual (Clic Derecho)
 
@@ -128,7 +153,10 @@ Selecciona uno o varios elementos y haz clic derecho para acceder a las opciones
 | Acción | Comando |
 | :--- | :--- |
 | **Zoom Miniaturas** | `Ctrl` + `Rueda Ratón` (o `Ctrl` + `+`/`-`) |
-| **Vista Previa Grande** | `Ctrl` + `Rueda Abajo` (sobre una foto/vídeo) |
+| **Vista Previa Grande** | **Doble Clic** (o `Ctrl` + `Rueda Abajo`) |
+| **Cerrar Vista Previa** | Tecla `ESC` (o `Ctrl` + `Rueda Arriba`) |
 | **Selección Múltiple** | `Ctrl` + `Clic` |
 | **Selección de Rango** | `Shift` + `Clic` |
 | **Selección por Arrastre** | Clic izquierdo y arrastrar sobre el fondo gris |
+
+````

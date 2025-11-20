@@ -10,10 +10,10 @@ import pickle
 import datetime
 
 class VisageVaultDB:
-    def __init__(self, db_name="visagevault.db"):
+    def __init__(self, db_name="visagevault.db", is_worker=False):
         """
         Inicializa la conexión a la base de datos.
-        Crea las tablas si no existen y verifica migraciones para versiones antiguas.
+        Si is_worker=True, evita crear tablas/migraciones para prevenir conflictos en hilos.
         """
         # Guardar la BD en el mismo directorio que el script
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,9 +23,10 @@ class VisageVaultDB:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # Permite acceder a columnas por nombre
 
-        # Inicialización
-        self._create_tables()
-        self._check_migrations()
+        # Solo el hilo principal debe gestionar la estructura de la BD
+        if not is_worker:
+            self._create_tables()
+            self._check_migrations()
 
     def _create_tables(self):
         """Crea la estructura inicial de tablas si no existe."""

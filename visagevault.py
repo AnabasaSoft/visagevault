@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.4.5 (con Pestaña de Vídeos)
+# VERSIÓN: 1.5
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -11,7 +11,16 @@
 #
 # ## 📜 Licencia
 #
-# (Texto de licencia sin cambios)
+# Este proyecto se ofrece bajo un modelo de **Doble Licencia (Dual License)**:
+#
+# 1.  **LGPLv3:** Ideal para proyectos de código abierto. Si usas esta biblioteca (especialmente
+#  si la modificas), debes cumplir con las obligaciones de la LGPLv3.
+# 2.  **Comercial (Privativa):** Si los términos de la LGPLv3 no se ajustan a tus necesidades
+#  (por ejemplo, para software propietario de código cerrado), por favor contacta al autor para
+#  adquirir una licencia comercial.
+#
+# Para más detalles, consulta el archivo `LICENSE` o la cabecera de `visagevault.py`.
+#
 #
 # ==============================================================================
 
@@ -21,7 +30,13 @@ from pathlib import Path
 import datetime
 import locale
 import warnings
+import sqlite3
 
+import threading # Necesario para evitar que la UI se congele
+from drive_auth import DriveAuthenticator
+import requests # Para bajar thumbnails
+from drive_manager import DriveManager
+import config_manager # Para guardar la carpeta elegida
 
 # --- Silenciar solo el aviso de pkg_resources ---
 warnings.filterwarnings(
@@ -154,11 +169,305 @@ class VideoThumbnailLoader(QRunnable):
             self.signals.load_failed.emit(self.original_filepath)
 
 # =================================================================
+# CLASE: NetworkThumbnailLoader (CON CACHÉ EN DISCO)
+# =================================================================
+class NetworkThumbnailLoader(QRunnable):
+    """
+    1. Mira si la miniatura ya existe en disco.
+    2. Si existe, la carga al instante.
+    3. Si no, la descarga, la guarda en disco y luego la carga.
+    """
+    def __init__(self, url, file_id, signals):
+        super().__init__()
+        self.url = url
+        self.file_id = file_id
+        self.signals = signals
+
+        # Definir ruta de caché específica para Drive
+        # Usamos .visagevault_cache/drive_thumbnails
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # visagevault_cache/drive_snapshot_cache
+        self.cache_dir = os.path.join(base_dir, "visagevault_cache", "drive_snapshot_cache")
+
+        if not os.path.exists(self.cache_dir):
+            try: os.makedirs(self.cache_dir)
+            except: pass
+
+        # Crear carpeta si no existe (hilo seguro porque makedirs es atómico o lanza error tolerable)
+        if not os.path.exists(self.cache_dir):
+            try:
+                os.makedirs(self.cache_dir)
+            except OSError:
+                pass # Ya existía
+
+    @Slot()
+    def run(self):
+        # Ruta del archivo: Usamos el ID de Google como nombre único
+        cache_path = os.path.join(self.cache_dir, f"{self.file_id}.jpg")
+
+        # --- 1. INTENTO DE CARGA DESDE CACHÉ (RÁPIDO) ---
+        if os.path.exists(cache_path):
+            # Verificar que no sea un archivo corrupto de 0 bytes
+            if os.path.getsize(cache_path) > 0:
+                try:
+                    pixmap = QPixmap(cache_path)
+                    if not pixmap.isNull():
+                        self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
+                        return
+                except Exception:
+                    pass # Si falla la carga local, intentamos descargar de nuevo
+
+            # Si llegamos aquí es que el archivo estaba corrupto o vacío
+            try: os.remove(cache_path)
+            except: pass
+
+        # --- 2. DESCARGA DE LA RED (LENTO) ---
+        if not self.url:
+            return
+
+        try:
+            # Descargar
+            response = requests.get(self.url, timeout=10)
+
+            if response.status_code == 200:
+                # 1. Guardar en disco para la próxima vez
+                with open(cache_path, 'wb') as f:
+                    f.write(response.content)
+
+                # 2. Cargar en memoria para mostrar ahora
+                pixmap = QPixmap()
+                pixmap.loadFromData(response.content)
+
+                if not pixmap.isNull():
+                    self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
+
+        except Exception as e:
+            # Si falla, no pasa nada, se queda con el icono de "Cargando" o genérico
+            # print(f"Error descargando thumb {self.file_id}: {e}")
+            pass
+
+class DriveFolderDialog(QDialog):
+    def __init__(self, drive_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Navegador de Google Drive")
+        self.resize(600, 450)
+        self.drive = drive_manager
+
+        # Estado de navegación
+        self.current_folder_id = None
+        self.current_folder_name = None
+        self.folder_history = []
+
+        self.selected_folder_id = None
+        self.selected_folder_name = None
+
+        layout = QVBoxLayout(self)
+
+        # 1. Cabecera con Ruta
+        self.path_label = QLabel("Inicio")
+        self.path_label.setStyleSheet("font-weight: bold; color: #3daee9; font-size: 14px; padding: 5px;")
+        layout.addWidget(self.path_label)
+
+        # --- NUEVO: AVISO INFORMATIVO ---
+        info_layout = QHBoxLayout()
+        info_icon = QLabel("ℹ️")
+        info_text = QLabel("Esta lista <b>SOLO muestra carpetas</b>. Tus fotos no aparecerán aquí, pero se escanearán al pulsar 'Seleccionar'.")
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet("color: gray; font-size: 11px;")
+        info_layout.addWidget(info_icon)
+        info_layout.addWidget(info_text, 1)
+        layout.addLayout(info_layout)
+        # --------------------------------
+
+        # 2. Lista
+        self.list_widget = QListWidget()
+        self.list_widget.setIconSize(QSize(32, 32))
+        self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
+        layout.addWidget(self.list_widget)
+
+        # 3. Botones
+        btn_layout = QHBoxLayout()
+        self.btn_select = QPushButton("Seleccionar esta carpeta")
+        self.btn_select.setEnabled(False)
+        self.btn_select.setStyleSheet("""
+            QPushButton { background-color: #3daee9; color: white; font-weight: bold; padding: 10px; border-radius: 4px;}
+            QPushButton:hover { background-color: #4dbef9; }
+            QPushButton:disabled { background-color: #cccccc; }
+        """)
+        self.btn_select.clicked.connect(self._select_current)
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.btn_select)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+
+        # CARGAR MENÚ INICIAL
+        self._load_home_menu()
+
+    def _load_home_menu(self):
+        self.list_widget.clear()
+        self.current_folder_id = "HOME"
+        self.current_folder_name = "Inicio"
+        self.path_label.setText("🏠 Inicio")
+        self.btn_select.setText("Selecciona una opción...")
+        self.btn_select.setEnabled(False)
+        self.folder_history = []
+
+        item_drive = QListWidgetItem("Mi Unidad")
+        item_drive.setData(Qt.UserRole, "root")
+        item_drive.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
+        self.list_widget.addItem(item_drive)
+
+        item_pc = QListWidgetItem("Ordenadores")
+        item_pc.setData(Qt.UserRole, "computers")
+        item_pc.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.list_widget.addItem(item_pc)
+
+    def _load_folder(self, folder_id, folder_name):
+        self.list_widget.clear()
+        self.current_folder_id = folder_id
+        self.current_folder_name = folder_name
+
+        path_str = " > ".join([name for _, name in self.folder_history] + [folder_name])
+        self.path_label.setText(path_str)
+
+        self.btn_select.setEnabled(True)
+        self.btn_select.setText(f"Seleccionar: '{folder_name}'")
+
+        back_item = QListWidgetItem(".. (Volver)")
+        back_item.setData(Qt.UserRole, "BACK")
+        back_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        back_item.setForeground(Qt.gray)
+        self.list_widget.addItem(back_item)
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            folders = self.drive.list_folders(folder_id)
+            QApplication.restoreOverrideCursor()
+
+            # Si no hay carpetas, avisamos pero permitimos seleccionar
+            if not folders:
+                info_item = QListWidgetItem("(No hay subcarpetas)")
+                info_item.setFlags(Qt.NoItemFlags) # No seleccionable
+                self.list_widget.addItem(info_item)
+
+            for f in folders:
+                item = QListWidgetItem(f['name'])
+                item.setData(Qt.UserRole, f['id'])
+                item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                self.list_widget.addItem(item)
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"No se pudo listar: {e}")
+
+    def _on_item_double_clicked(self, item):
+        data = item.data(Qt.UserRole)
+        if not data: return
+
+        if data == "BACK":
+            if self.folder_history:
+                prev_id, prev_name = self.folder_history.pop()
+                if prev_id == "HOME":
+                    self._load_home_menu()
+                else:
+                    self._load_folder(prev_id, prev_name)
+            else:
+                self._load_home_menu()
+
+        elif data == "root" or data == "computers":
+            self.folder_history.append(("HOME", "Inicio"))
+            self._load_folder(data, item.text())
+
+        else:
+            self.folder_history.append((self.current_folder_id, self.current_folder_name))
+            self._load_folder(data, item.text())
+
+    def _select_current(self):
+        if self.current_folder_id == "HOME" or self.current_folder_id == "computers":
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Aviso", "Por favor, entra en una carpeta específica para seleccionarla.")
+            return
+
+        self.selected_folder_id = self.current_folder_id
+        self.selected_folder_name = self.current_folder_name
+        self.accept()
+
+# =================================================================
 # SEÑALES Y WORKER PARA CARGAR Y RECORTAR CARAS (Sin cambios)
 # =================================================================
 class FaceLoaderSignals(QObject):
     face_loaded = Signal(int, QPixmap, str)
     face_load_failed = Signal(int)
+
+# =================================================================
+# WORKER PARA LOGIN DE GOOGLE DRIVE
+# =================================================================
+class DriveLoginWorker(QObject):
+    """Worker para manejar la autenticación de Google Drive en segundo plano."""
+    login_success = Signal(object)  # Emite el servicio de Drive
+    login_failed = Signal(str)      # Emite mensaje de error
+    finished = Signal()
+
+    def __init__(self):
+        super().__init__()
+
+    @Slot()
+    def run(self):
+        try:
+            from drive_auth import DriveAuthenticator
+            auth = DriveAuthenticator()
+            service = auth.get_service()
+            self.login_success.emit(service)
+        except FileNotFoundError as e:
+            self.login_failed.emit(str(e))
+        except Exception as e:
+            print(f"Error de Login con Google: {e}")
+            self.login_failed.emit(str(e))
+        finally:
+            self.finished.emit()
+
+class DriveScanWorker(QObject):
+    """Worker dedicado a escanear Google Drive y enviar resultados a la UI."""
+    items_found = Signal(list)  # Señal para enviar lotes de fotos
+    progress = Signal(str)      # Señal para actualizar barra de estado
+    finished = Signal(int)      # Señal de finalización con total
+
+    def __init__(self, folder_id):
+        super().__init__()
+        self.folder_id = folder_id
+        self.is_running = True
+
+    @Slot()
+    def run(self):
+        try:
+            # Instancia local de DriveManager (Seguridad de Hilos)
+            # Importamos aquí por si acaso, aunque esté global
+            from drive_manager import DriveManager
+            local_manager = DriveManager()
+
+            self.progress.emit("Iniciando escaneo recursivo en la nube...")
+            count = 0
+
+            # Iterar sobre el generador de imágenes
+            for batch_of_images in local_manager.list_images_recursively(self.folder_id):
+                if not self.is_running:
+                    break
+
+                count += len(batch_of_images)
+                # Emitir señal: Esto despierta a la interfaz de forma segura
+                self.items_found.emit(batch_of_images)
+                self.progress.emit(f"Escaneando... {count} fotos encontradas.")
+
+            self.finished.emit(count)
+
+        except Exception as e:
+            print(f"Error en DriveScanWorker: {e}")
+            self.progress.emit(f"Error de escaneo: {e}")
+            self.finished.emit(count)
 
 # =================================================================
 # CLASE OPTIMIZADA: CARGA DE CARAS CON CACHÉ DE DISCO
@@ -170,9 +479,15 @@ class FaceLoader(QRunnable):
         self.face_id = face_id
         self.photo_path = photo_path
         self.location_str = location_str
-        # Definimos la ruta donde debería estar la miniatura guardada
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.cache_path = os.path.join(base_dir, "face_cache", f"face_{self.face_id}.jpg")
+        # visagevault_cache/face_cache
+        self.cache_dir = os.path.join(base_dir, "visagevault_cache", "face_cache")
+
+        if not os.path.exists(self.cache_dir):
+            try: os.makedirs(self.cache_dir)
+            except: pass
+
+        self.cache_path = os.path.join(self.cache_dir, f"face_{self.face_id}.jpg")
 
     @Slot()
     def run(self):
@@ -249,22 +564,29 @@ class ClusterSignals(QObject):
     clustering_finished = Signal()
 
 class ClusterWorker(QRunnable):
-    def __init__(self, signals: ClusterSignals, db_manager: VisageVaultDB):
+    def __init__(self, signals: ClusterSignals, db_path: str):
         super().__init__()
         self.signals = signals
-        self.db = db_manager
+        self.db_path = db_path
 
     @Slot()
     def run(self):
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        local_db.conn.row_factory = sqlite3.Row
+
         try:
             self.signals.clustering_progress.emit("Cargando datos de caras...")
-            face_data = self.db.get_unknown_face_encodings()
+            face_data = local_db.get_unknown_face_encodings()
 
             if len(face_data) < 2:
                 self.signals.clustering_progress.emit("No hay suficientes caras para comparar.")
                 self.signals.clusters_found.emit([])
                 self.signals.clustering_finished.emit()
                 return
+
+            # ... (Resto de lógica igual que antes) ...
 
             self.signals.clustering_progress.emit(f"Comparando {len(face_data)} caras...")
             face_ids = [data[0] for data in face_data]
@@ -289,6 +611,7 @@ class ClusterWorker(QRunnable):
             print(f"Error crítico en el ClusterWorker: {e}")
             self.signals.clustering_progress.emit(f"Error: {e}")
         finally:
+            local_db.conn.close()
             self.signals.clustering_finished.emit()
 
 # =================================================================
@@ -349,66 +672,59 @@ class ImagePreviewDialog(QDialog):
         super().resizeEvent(event)
 
 # =================================================================
-# CLASE: PreviewListWidget (¡MEJORADA PARA SHIFT!)
+# CLASE: PreviewListWidget
+# =================================================================
+# =================================================================
+# CLASE: PreviewListWidget (LIMPIA)
 # =================================================================
 class PreviewListWidget(QListWidget):
     """
-    QListWidget personalizado que:
-    1. Emite señal para vista previa (Ctrl+Rueda).
-    2. Arregla la selección con SHIFT para que sea lineal (de A a B).
+    QListWidget personalizado:
+    1. Doble Clic -> Abre Vista Previa.
+    2. ESC -> Cierra Vista Previa activa.
+    3. Shift+Clic -> Selección múltiple lineal.
     """
-    previewRequested = Signal(str) # Emite la ruta del archivo
+    previewRequested = Signal(object)
 
-    def wheelEvent(self, event: QKeyEvent):
-        if event.modifiers() == Qt.ControlModifier:
-            # Ctrl está presionado -> Zoom o Vista previa
-            if event.angleDelta().y() < 0: # Rueda HACIA ABAJO
-                item = self.itemAt(event.position().toPoint())
-                if item:
-                    path = item.data(Qt.UserRole)
-                    if path:
-                        self.previewRequested.emit(path)
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item:
+                data = item.data(Qt.UserRole)
+                if data:
+                    self.previewRequested.emit(data)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
 
-            # Aceptar el evento para evitar el zoom nativo feo
-            event.accept()
-            return
-
-        # Sin Ctrl, es scroll normal
-        super().wheelEvent(event)
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Escape:
+            from PySide6.QtWidgets import QApplication
+            for widget in QApplication.allWidgets():
+                if isinstance(widget, ImagePreviewDialog) and widget.isVisible():
+                    if hasattr(widget, 'close_with_animation'):
+                        widget.close_with_animation()
+                    else:
+                        widget.close()
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
-        """
-        Sobrescribimos el clic para arreglar la selección con SHIFT.
-        """
-        # Si es click izquierdo Y Shift está pulsado
         if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier):
-
             item_clicked = self.itemAt(event.position().toPoint())
             current_anchor = self.currentItem()
-
-            # Solo actuamos si hemos hecho clic en un item y ya había uno seleccionado antes
             if item_clicked and current_anchor:
                 start_row = self.row(current_anchor)
                 end_row = self.row(item_clicked)
-
-                # Calculamos el rango (índice menor a mayor)
                 low = min(start_row, end_row)
                 high = max(start_row, end_row)
-
-                # Si NO estamos pulsando Ctrl también, limpiamos la selección previa
-                # (Comportamiento estándar de Windows/Linux)
                 if not (event.modifiers() & Qt.ControlModifier):
                     self.clearSelection()
-
-                # Seleccionamos manualmente el rango
                 for i in range(low, high + 1):
                     self.item(i).setSelected(True)
-
-                # IMPORTANTE: Actualizamos el 'foco' al nuevo item para el siguiente Shift
                 self.setCurrentItem(item_clicked)
                 return
-
-        # Si no es Shift+Click, dejamos que Qt haga su trabajo (Ctrl, Click normal, Arrastrar...)
         super().mousePressEvent(event)
 
 # =================================================================
@@ -996,18 +1312,26 @@ class PhotoFinderWorker(QObject):
     finished = Signal(dict)
     progress = Signal(str)
 
-    def __init__(self, directory_path: str, db_manager: VisageVaultDB):
+    # Recibimos db_path (texto) en lugar de db_manager (objeto)
+    def __init__(self, directory_path: str, db_path: str):
         super().__init__()
         self.directory_path = directory_path
-        self.db = db_manager
+        self.db_path = db_path
         self.is_running = True
 
     @Slot()
     def run(self):
+        # Abrimos nuestra propia conexión segura
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        # Forzamos que use la ruta correcta si no coincide con el default
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        local_db.conn.row_factory = sqlite3.Row
+
         photos_by_year_month = {}
         try:
             self.progress.emit("Cargando fechas de fotos conocidas desde la BD...")
-            db_dates = self.db.load_all_photo_dates()
+            db_dates = local_db.load_all_photo_dates()
 
             self.progress.emit("Escaneando archivos de FOTOS en el directorio...")
             photo_paths_on_disk = find_photos(self.directory_path)
@@ -1037,12 +1361,11 @@ class PhotoFinderWorker(QObject):
 
             if paths_to_delete:
                 self.progress.emit(f"Eliminando {len(paths_to_delete)} fotos de la BD...")
-                # Asumiendo que has creado 'bulk_delete_photos' en db_manager.py
-                self.db.bulk_delete_photos(paths_to_delete)
+                local_db.bulk_delete_photos(paths_to_delete)
 
             if photos_to_upsert_in_db:
                 self.progress.emit(f"Guardando {len(photos_to_upsert_in_db)} fotos nuevas en la BD...")
-                self.db.bulk_upsert_photos(photos_to_upsert_in_db)
+                local_db.bulk_upsert_photos(photos_to_upsert_in_db)
 
             self.progress.emit(f"Escaneo de fotos finalizado. Encontradas {len(photo_paths_on_disk)} fotos.")
 
@@ -1050,6 +1373,8 @@ class PhotoFinderWorker(QObject):
             print(f"Error crítico en el hilo PhotoFinderWorker: {e}")
             self.progress.emit(f"Error en escaneo de fotos: {e}")
         finally:
+            # Cerramos conexión
+            local_db.conn.close()
             self.finished.emit(photos_by_year_month)
 
 # =================================================================
@@ -1059,19 +1384,23 @@ class VideoFinderWorker(QObject):
     finished = Signal(dict)
     progress = Signal(str)
 
-    def __init__(self, directory_path: str, db_manager: VisageVaultDB):
+    def __init__(self, directory_path: str, db_path: str):
         super().__init__()
         self.directory_path = directory_path
-        self.db = db_manager
+        self.db_path = db_path
         self.is_running = True
 
     @Slot()
     def run(self):
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        local_db.conn.row_factory = sqlite3.Row
+
         videos_by_year_month = {}
         try:
             self.progress.emit("Cargando fechas de vídeos conocidas desde la BD...")
-            # --- MODIFICADO ---
-            db_dates = self.db.load_all_video_dates()
+            db_dates = local_db.load_all_video_dates()
 
             self.progress.emit("Escaneando archivos de VÍDEOS en el directorio...")
             video_paths_on_disk = find_videos(self.directory_path)
@@ -1101,20 +1430,19 @@ class VideoFinderWorker(QObject):
 
             if paths_to_delete:
                 self.progress.emit(f"Eliminando {len(paths_to_delete)} vídeos de la BD...")
-                # Asumiendo que has creado 'bulk_delete_videos' en db_manager.py
-                self.db.bulk_delete_videos(paths_to_delete)
+                local_db.bulk_delete_videos(paths_to_delete)
 
             if videos_to_upsert_in_db:
                 self.progress.emit(f"Guardando {len(videos_to_upsert_in_db)} vídeos nuevos en la BD...")
-                self.db.bulk_upsert_videos(videos_Image.open(to_upsert_in_db))
+                local_db.bulk_upsert_videos(videos_to_upsert_in_db)
 
             self.progress.emit(f"Escaneo de vídeos finalizado. Encontrados {len(video_paths_on_disk)} vídeos.")
-            # --- FIN DE MODIFICACIÓN ---
 
         except Exception as e:
             print(f"Error crítico en el hilo VideoFinderWorker: {e}")
             self.progress.emit(f"Error en escaneo de vídeos: {e}")
         finally:
+            local_db.conn.close()
             self.finished.emit(videos_by_year_month)
 
 # =================================================================
@@ -1127,16 +1455,21 @@ class FaceScanSignals(QObject):
     scan_finished = Signal()
 
 class FaceScanWorker(QObject):
-    def __init__(self, db_manager: VisageVaultDB):
+    def __init__(self, db_path: str):
         super().__init__()
-        self.db = db_manager
+        self.db_path = db_path
         self.signals = FaceScanSignals()
         self.is_running = True
     @Slot()
     def run(self):
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        local_db.conn.row_factory = sqlite3.Row
+
         try:
             self.signals.scan_progress.emit("Buscando fotos sin escanear...")
-            unscanned_photos = self.db.get_unscanned_photos()
+            unscanned_photos = local_db.get_unscanned_photos()
             total = len(unscanned_photos)
             if total == 0:
                 self.signals.scan_progress.emit("No hay fotos nuevas que escanear.")
@@ -1145,7 +1478,6 @@ class FaceScanWorker(QObject):
                 return
             self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
 
-            # Definir extensiones RAW
             RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
 
             for i, row in enumerate(unscanned_photos):
@@ -1158,52 +1490,46 @@ class FaceScanWorker(QObject):
                 self.signals.scan_percentage.emit(percentage)
 
                 try:
-                    # --- INICIO DE MODIFICACIÓN RAW ---
                     image = None
                     file_suffix = Path(photo_path).suffix.lower()
 
                     if file_suffix in RAW_EXTENSIONS:
                         try:
                             with rawpy.imread(photo_path) as raw:
-                                # .postprocess() devuelve un array numpy (H, W, 3)
-                                # que es lo que face_recognition espera.
                                 image = raw.postprocess()
                         except Exception as raw_e:
-                            print(f"Error de Rawpy al procesar {photo_path} (scan): {raw_e}")
-                            # Si rawpy falla, lo marcamos como escaneado y continuamos
-                            self.db.mark_photo_as_scanned(photo_id)
+                            print(f"Error de Rawpy: {raw_e}")
+                            local_db.mark_photo_as_scanned(photo_id)
                             continue
                     else:
-                        # Lógica original para JPG, PNG, etc.
-                        # face_recognition.load_image_file también devuelve un array numpy
                         image = face_recognition.load_image_file(photo_path)
 
                     if image is None:
-                        # No se pudo cargar la imagen
-                        self.db.mark_photo_as_scanned(photo_id)
+                        local_db.mark_photo_as_scanned(photo_id)
                         continue
-                    # --- FIN DE MODIFICACIÓN RAW ---
 
                     locations = face_recognition.face_locations(image)
                     if not locations:
-                        self.db.mark_photo_as_scanned(photo_id)
+                        local_db.mark_photo_as_scanned(photo_id)
                         continue
                     encodings = face_recognition.face_encodings(image, locations)
                     for loc, enc in zip(locations, encodings):
                         location_str = str(loc)
                         encoding_blob = pickle.dumps(enc)
-                        face_id = self.db.add_face(photo_id, encoding_blob, location_str)
+                        face_id = local_db.add_face(photo_id, encoding_blob, location_str)
                         self.signals.face_found.emit(face_id, photo_path, location_str)
-                    self.db.mark_photo_as_scanned(photo_id)
+                    local_db.mark_photo_as_scanned(photo_id)
                 except Exception as e:
                     print(f"Error procesando caras en {photo_path}: {e}")
-                    self.db.mark_photo_as_scanned(photo_id)
+                    local_db.mark_photo_as_scanned(photo_id)
             self.signals.scan_progress.emit("Escaneo de caras finalizado.")
             self.signals.scan_finished.emit()
         except Exception as e:
             print(f"Error crítico en el hilo de escaneo de caras: {e}")
             self.signals.scan_progress.emit(f"Error: {e}")
             self.signals.scan_finished.emit()
+        finally:
+            local_db.conn.close()
 
 # =================================================================
 # CLASE: DIÁLOGO DE AYUDA Y ACERCA DE
@@ -1305,7 +1631,7 @@ class PhotoDirWatcher(QObject):
         if os.path.isdir(self.path_to_watch):
             self.observer.schedule(self.handler, self.path_to_watch, recursive=True)
             self.observer.start()
-            print(f"Vigilando cambios en: {self.path_to_watch}")
+            # print(f"Vigilando cambios en: {self.path_to_watch}")
 
     def stop(self):
         if self.observer.is_alive():
@@ -1352,9 +1678,16 @@ class VisageVaultApp(QMainWindow):
         else:
             print(f"Advertencia: No se pudo encontrar el icono en {icon_path}")
 
-        self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_cache")
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.root_cache = os.path.join(base_dir, "visagevault_cache")
+
+        # Creamos la estructura si no existe
+        os.makedirs(os.path.join(self.root_cache, "face_cache"), exist_ok=True)
+        os.makedirs(os.path.join(self.root_cache, "drive_cache"), exist_ok=True)
+        os.makedirs(os.path.join(self.root_cache, "drive_snapshot_cache"), exist_ok=True)
+
+        # Referencia para compatibilidad si se usa self.cache_dir en algún sitio antiguo
+        self.cache_dir = self.root_cache
 
         self.refresh_timer = QTimer()
         self.refresh_timer.setSingleShot(True)
@@ -1467,8 +1800,8 @@ class VisageVaultApp(QMainWindow):
         self.date_tree_widget.currentItemChanged.connect(self._scroll_to_item)
         photo_right_panel_layout.addWidget(self.date_tree_widget)
 
-        self.status_label = QLabel("Estado: Inicializando...")
-        photo_right_panel_layout.addWidget(self.status_label)
+        # self.status_label = QLabel("Estado: Inicializando...")
+        # photo_right_panel_layout.addWidget(self.status_label)
         self.main_splitter.addWidget(photo_right_panel_widget)
 
         fotos_layout.addWidget(self.main_splitter)
@@ -1621,12 +1954,70 @@ class VisageVaultApp(QMainWindow):
         help_layout.addStretch(1)
 
         # ==========================================================
+        # PESTAÑA NUBE (Google Drive) - ORGANIZADA POR FECHA
+        # ==========================================================
+        self.cloud_tab = QWidget()
+        cloud_layout = QVBoxLayout(self.cloud_tab)
+
+        # 1. Cabecera (Botón Login y Cambiar Carpeta)
+        header_layout = QHBoxLayout()
+        self.btn_gdrive = QPushButton("Iniciar sesión con Google")
+        self.btn_gdrive.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
+        self.btn_gdrive.clicked.connect(self._on_gdrive_login_click)
+        header_layout.addWidget(self.btn_gdrive)
+
+        self.btn_change_folder = QPushButton("Cambiar Carpeta")
+        self.btn_change_folder.setVisible(False)
+        self.btn_change_folder.clicked.connect(self._select_drive_folder)
+        header_layout.addWidget(self.btn_change_folder)
+
+        header_layout.addStretch() # Empujar botones a la izquierda
+        cloud_layout.addLayout(header_layout)
+
+        # 2. Splitter Principal (Igual que en Fotos: Árbol a la derecha, Fotos a la izquierda)
+        self.cloud_splitter = QSplitter(Qt.Horizontal)
+
+        # --- PANEL IZQUIERDO: Área de Scroll para las Fotos ---
+        cloud_area_widget = QWidget()
+        self.cloud_container_layout = QVBoxLayout(cloud_area_widget)
+        self.cloud_container_layout.setSpacing(0)
+
+        self.cloud_scroll_area = QScrollArea()
+        self.cloud_scroll_area.setWidgetResizable(True)
+        self.cloud_scroll_area.setWidget(cloud_area_widget)
+
+        # Conectamos el scroll para cargar miniaturas bajo demanda (Lazy Loading)
+        self.cloud_scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_cloud_thumbnails)
+
+        self.cloud_splitter.addWidget(self.cloud_scroll_area)
+
+        # --- PANEL DERECHO: Árbol de Fechas ---
+        cloud_right_panel = QWidget()
+        cloud_right_layout = QVBoxLayout(cloud_right_panel)
+
+        cloud_right_layout.addWidget(QLabel("Navegación Nube:"))
+        self.cloud_date_tree = QTreeWidget()
+        self.cloud_date_tree.setHeaderHidden(True)
+        self.cloud_date_tree.currentItemChanged.connect(self._scroll_to_cloud_item)
+        cloud_right_layout.addWidget(self.cloud_date_tree)
+
+        self.cloud_splitter.addWidget(cloud_right_panel)
+        self.cloud_splitter.setSizes([800, 200]) # Tamaño inicial
+
+        cloud_layout.addWidget(self.cloud_splitter)
+
+        # Variables de memoria para la nube
+        self.drive_photos_by_date = {} # Estructura: { '2023': { '01': [datos_foto, ...] } }
+        self.cloud_group_widgets = {}  # Para el scroll automático
+
+        # ==========================================================
         # 6. Añadir pestañas al Widget Central (MODIFICADO)
         # ==========================================================
         self.tab_widget.addTab(fotos_tab_widget, "Fotos")
         self.tab_widget.addTab(videos_tab_widget, "Vídeos")
         self.tab_widget.addTab(self.personas_tab_widget, "Personas")
-        self.tab_widget.addTab(help_tab_widget, "Ayuda") # <--- AÑADIR ESTA LÍNEA
+        self.tab_widget.addTab(self.cloud_tab, "Nube")
+        self.tab_widget.addTab(help_tab_widget, "Ayuda")
 
         self.setCentralWidget(self.tab_widget)
 
@@ -1706,7 +2097,7 @@ class VisageVaultApp(QMainWindow):
     @Slot()
     def _perform_auto_refresh(self):
         """Ejecuta el re-escaneo real tras el periodo de calma."""
-        print("Detectados cambios en el disco. Actualizando galería...")
+        # print("Detectados cambios en el disco. Actualizando galería...")
         self._set_status("Detectados cambios externos. Actualizando...")
 
         if self.current_directory:
@@ -1724,7 +2115,7 @@ class VisageVaultApp(QMainWindow):
             return
 
         self.photo_thread = QThread()
-        self.photo_worker = PhotoFinderWorker(directory, self.db)
+        self.photo_worker = PhotoFinderWorker(directory, self.db.db_path)
         self.photo_worker.moveToThread(self.photo_thread)
 
         self.photo_thread.started.connect(self.photo_worker.run)
@@ -1746,7 +2137,7 @@ class VisageVaultApp(QMainWindow):
             return
 
         self.video_thread = QThread()
-        self.video_worker = VideoFinderWorker(directory, self.db)
+        self.video_worker = VideoFinderWorker(directory, self.db.db_path)
         self.video_worker.moveToThread(self.video_thread)
 
         self.video_thread.started.connect(self.video_worker.run)
@@ -1770,7 +2161,7 @@ class VisageVaultApp(QMainWindow):
             self._set_status("El escaneo de caras ya está en curso.")
             return
         self.face_scan_thread = QThread()
-        self.face_scan_worker = FaceScanWorker(self.db)
+        self.face_scan_worker = FaceScanWorker(self.db.db_path)
         self.face_scan_worker.moveToThread(self.face_scan_thread)
         self.face_scan_worker.signals.scan_progress.connect(self._set_status)
         self.face_scan_worker.signals.scan_percentage.connect(self._update_face_scan_percentage)
@@ -2492,7 +2883,7 @@ class VisageVaultApp(QMainWindow):
         # 1. OPTIMIZACIÓN: Si los datos no han cambiado, NO redibujamos nada.
         # Esto evita parpadeos por falsas alarmas del vigilante.
         if self.photos_by_year_month == new_photos_by_year_month:
-            print("Escaneo completado: Sin cambios detectados.")
+            # print("Escaneo completado: Sin cambios detectados.")
             # Aún así lanzamos el escáner de caras por si acaso
             self._start_face_scan()
             return
@@ -2525,7 +2916,7 @@ class VisageVaultApp(QMainWindow):
 
         # 1. Verificar cambios
         if self.videos_by_year_month == new_videos_by_year_month:
-            print("Escaneo de vídeos completado: Sin cambios.")
+            # print("Escaneo de vídeos completado: Sin cambios.")
             return
 
         self.videos_by_year_month = new_videos_by_year_month
@@ -2547,7 +2938,8 @@ class VisageVaultApp(QMainWindow):
         self.video_scroll_area.setUpdatesEnabled(True)
 
     def _set_status(self, message):
-        self.status_label.setText(f"Estado: {message}")
+        # Usamos la barra de estado nativa de la ventana (visible en todas las pestañas)
+        self.statusBar().showMessage(f"Estado: {message}")
 
     def _load_main_visible_thumbnails(self):
         """Carga miniaturas de FOTOS visibles (Refactorizado para QListWidget)."""
@@ -2625,87 +3017,178 @@ class VisageVaultApp(QMainWindow):
                     self.threadpool.start(loader)
 
     @Slot(str, QPixmap)
-    def _update_thumbnail(self, original_path: str, pixmap: QPixmap):
-
-        # --- Lógica de Zoom (¡CORREGIDA!) ---
-        # El pixmap que llega es del tamaño original de la miniatura (ej. 128x128).
-        # Debemos escalarlo al tamaño de zoom que el usuario tenga seleccionado actualmente.
-
+    def _update_thumbnail(self, original_path, pixmap):
         # ---------------------------------------------------------
-        # 1. BLOQUE PARA FOTOS (Ajustar tamaño de selección)
+        # 1. BLOQUE PARA FOTOS
         # ---------------------------------------------------------
         if original_path in self.photo_list_widget_items:
             item = self.photo_list_widget_items[original_path]
-
-            # Escalar el pixmap al tamaño de zoom actual manteniendo la proporción
             scaled_pixmap = pixmap.scaled(
                 self.current_thumbnail_size,
                 self.current_thumbnail_size,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-
             item.setIcon(QIcon(scaled_pixmap))
-
-            # --- NUEVO: Ajustar el tamaño del área de selección al de la imagen ---
             item.setSizeHint(scaled_pixmap.size())
-            # ----------------------------------------------------------------------
-
-            item.setText("") # Quitar el texto "Cargando..."
+            item.setText("")
             item.setData(Qt.UserRole + 1, "loaded")
             return
 
         # ---------------------------------------------------------
-        # 2. BLOQUE PARA VÍDEOS (Ajustar tamaño de selección)
+        # 2. BLOQUE PARA VÍDEOS
         # ---------------------------------------------------------
         if original_path in self.video_list_widget_items:
             item = self.video_list_widget_items[original_path]
-
-            # Escalar el pixmap al tamaño de zoom actual
             scaled_pixmap = pixmap.scaled(
                 self.current_thumbnail_size,
                 self.current_thumbnail_size,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-
             item.setIcon(QIcon(scaled_pixmap))
-
-            # --- NUEVO: Ajustar el tamaño del área de selección al de la imagen ---
             item.setSizeHint(scaled_pixmap.size())
-            # ----------------------------------------------------------------------
-
-            item.setText("") # Quitar el texto "Cargando..."
+            item.setText("")
             item.setData(Qt.UserRole + 1, "loaded")
             return
 
         # ---------------------------------------------------------
-        # 3. BLOQUE PARA PESTAÑA PERSONAS (Sin cambios)
+        # 3. BLOQUE PARA DRIVE (ACTUALIZADO PARA MÚLTIPLES LISTAS)
+        # ---------------------------------------------------------
+        # Buscamos en TODAS las listas que estén dentro de la pestaña Nube
+        if self.cloud_scroll_area.widget():
+            for list_widget in self.cloud_scroll_area.widget().findChildren(PreviewListWidget):
+                # Optimización: Solo buscar si la lista está visible
+                if not list_widget.isVisible(): continue
+
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    data = item.data(Qt.UserRole)
+
+                    # original_path aquí es el FILE ID de Google
+                    if data and data.get('id') == original_path:
+                        scaled = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        item.setIcon(QIcon(scaled))
+                        item.setText("")
+                        item.setData(Qt.UserRole + 1, "loaded")
+                        return # Encontrado, salimos
+
+        # ---------------------------------------------------------
+        # 4. BLOQUE PARA PERSONAS
         # ---------------------------------------------------------
         def update_in_container(container_widget):
             if not container_widget:
                 return
-            # En la pestaña Personas usamos ZoomableClickableLabel, no QListWidget
             for label in container_widget.findChildren(ZoomableClickableLabel):
                 if label.property("original_path") == original_path and label.property("loaded") is not True:
-                    # Usamos la constante THUMBNAIL_SIZE original para la pestaña personas
                     label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
                     label.setText("")
                     label.setProperty("loaded", True)
 
         update_in_container(self.person_photo_scroll_area.widget())
 
-        # Lógica original (para la pestaña Personas)
-        def update_in_container(container_widget):
-            if not container_widget:
+    # -------------------------------------------------------------------------
+    # GESTIÓN DE VISTA PREVIA EN LA NUBE
+    # -------------------------------------------------------------------------
+
+    @Slot(object)
+    def _on_drive_preview_requested(self, file_data):
+        """
+        Maneja la solicitud de vista previa desde la nube.
+        """
+        if not isinstance(file_data, dict): return
+        file_id = file_data.get('id')
+        name = file_data.get('name')
+        if not file_id or not name: return
+
+        self._set_status(f"Vista previa: Bajando {name}...")
+
+        # --- NUEVA RUTA UNIFICADA ---
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # visagevault_cache/drive_cache
+        temp_dir = os.path.join(base_dir, "visagevault_cache", "drive_cache")
+        # ----------------------------
+
+        if not os.path.exists(temp_dir): os.makedirs(temp_dir)
+        local_path = os.path.join(temp_dir, name)
+
+        # Comprobar Caché
+        if os.path.exists(local_path):
+            if os.path.getsize(local_path) == 0:
+                try: os.remove(local_path)
+                except: pass
+            else:
+                self._open_preview_dialog(local_path)
+                self._set_status("Vista previa (desde caché).")
                 return
-            for label in container_widget.findChildren(ZoomableClickableLabel):
-                if label.property("original_path") == original_path and label.property("loaded") is not True:
-                    label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    label.setText("")
-                    label.setProperty("loaded", True)
 
-        update_in_container(self.person_photo_scroll_area.widget())
+        # Descarga en hilo seguro
+        threading.Thread(target=self._download_thread_safe, args=(file_id, local_path), daemon=True).start()
+
+    def _download_thread_safe(self, file_id, local_path):
+        """Descarga el archivo sin bloquear la interfaz."""
+        try:
+            manager = DriveManager()
+            manager.download_file(file_id, local_path)
+
+            # Volver al hilo principal para abrir la ventana
+            QTimer.singleShot(0, lambda: self._finish_cloud_preview(local_path))
+        except Exception as e:
+            print(f"Error descarga preview: {e}")
+            QTimer.singleShot(0, lambda: self._set_status("Error al descargar imagen."))
+            # Borrar archivo parcial si falló
+            if os.path.exists(local_path):
+                try: os.remove(local_path)
+                except: pass
+
+    def _finish_cloud_preview(self, local_path):
+        """Se ejecuta en el hilo principal cuando la descarga termina."""
+        self._set_status("Imagen descargada. Abriendo visor...")
+        self._open_preview_dialog(local_path)
+
+    def _download_for_preview(self, file_id, local_path):
+        """Descarga y abre el diálogo de vista previa rápida."""
+        try:
+            local_manager = DriveManager()
+            local_manager.download_file(file_id, local_path)
+
+            # Abrir la vista previa (ImagePreviewDialog) en el hilo principal
+            QTimer.singleShot(0, lambda: self._open_preview_dialog(local_path))
+            QTimer.singleShot(0, lambda: self._set_status("Vista previa lista."))
+        except Exception as e:
+            print(f"Error descarga preview: {e}")
+            QTimer.singleShot(0, lambda: self._set_status("Error al descargar para vista previa."))
+
+    @Slot(QListWidgetItem)
+    def _on_drive_item_double_clicked(self, item):
+        file_data = item.data(Qt.UserRole)
+        if not file_data: return
+
+        file_id = file_data['id']
+        name = file_data['name']
+
+        self._set_status(f"Descargando {name} de la nube...")
+
+        # Crear carpeta temporal si no existe
+        temp_dir = os.path.join(self.root_cache, "drive_cache")
+        if not os.path.exists(temp_dir): os.makedirs(temp_dir)
+
+        local_path = os.path.join(temp_dir, name)
+
+        # Descargar en hilo para no congelar
+        threading.Thread(target=self._download_and_show, args=(file_id, local_path), daemon=True).start()
+
+    def _download_and_show(self, file_id, local_path):
+        try:
+            # --- CORRECCIÓN CRÍTICA DE SEGURIDAD DE HILOS ---
+            local_manager = DriveManager()
+            local_manager.download_file(file_id, local_path)
+
+            # Volver a UI para abrir el visor
+            QTimer.singleShot(0, lambda: self._open_photo_detail(local_path))
+            QTimer.singleShot(0, lambda: self._set_status("Descarga completada."))
+        except Exception as e:
+            print(f"Error descarga: {e}")
 
     @Slot(str)
     def _handle_thumbnail_failed(self, original_path: str):
@@ -2802,7 +3285,7 @@ class VisageVaultApp(QMainWindow):
         if not self.photos_by_year_month and not self.videos_by_year_month:
             return
 
-        print(f"Redibujando layout para el nuevo ancho.")
+        # print(f"Redibujando layout para el nuevo ancho.")
         # Re-dibujar AMBAS pestañas
         if self.photos_by_year_month:
             self._display_photos()
@@ -3355,7 +3838,7 @@ class VisageVaultApp(QMainWindow):
         self.cluster_faces_button.setText("Procesando...")
         self.cluster_faces_button.setEnabled(False)
         self._set_status("Iniciando búsqueda de duplicados...")
-        worker = ClusterWorker(self.cluster_signals, self.db)
+        worker = ClusterWorker(self.cluster_signals, self.db.db_path)
         self.threadpool.start(worker)
 
     @Slot(list)
@@ -3625,6 +4108,390 @@ class VisageVaultApp(QMainWindow):
             # Lo ideal sería invalidar la caché de thumbnails de estas fotos específicas
             # Como solución simple, recargamos la vista:
             self._display_photos()
+
+    @Slot()
+    def _on_gdrive_login_click(self):
+        self.btn_gdrive.setEnabled(False)
+        self.btn_gdrive.setText("Esperando navegador...")
+        self._set_status("Abriendo navegador para inicio de sesión en Google...")
+
+        # Crear worker y thread de Qt
+        self.drive_login_thread = QThread()
+        self.drive_login_worker = DriveLoginWorker()
+        self.drive_login_worker.moveToThread(self.drive_login_thread)
+
+        # Conectar señales
+        self.drive_login_thread.started.connect(self.drive_login_worker.run)
+        self.drive_login_worker.login_success.connect(self._on_login_success_with_service)
+        self.drive_login_worker.login_failed.connect(self._on_login_failure)
+
+        # Limpieza
+        self.drive_login_worker.finished.connect(self.drive_login_thread.quit)
+        self.drive_login_worker.finished.connect(self.drive_login_worker.deleteLater)
+        self.drive_login_thread.finished.connect(lambda: setattr(self, 'drive_login_thread', None))
+
+        self.drive_login_thread.start()
+
+    @Slot(object)
+    def _on_login_success_with_service(self, service):
+        """Recibe el servicio de Drive y continúa con la configuración."""
+        self.drive_service = service
+        self._on_login_success()
+
+    @Slot(str)
+    def _on_login_failure(self, error_message=None):
+        """Maneja el fallo en el login."""
+        self.btn_gdrive.setEnabled(True)
+        self.btn_gdrive.setText("Reintentar conexión")
+        if error_message:
+            self._set_status(f"Conexión fallida: {error_message}")
+        else:
+            self._set_status("Conexión fallida. Verifique sus credenciales.")
+
+    def _perform_google_login(self):
+        try:
+            self.drive_auth = DriveAuthenticator()
+            # Esta línea bloquea el hilo hasta que el usuario inicia sesión en el navegador
+            self.drive_service = self.drive_auth.get_service()
+
+            # Si llegamos aquí, fue exitoso. Programar actualización de UI en el hilo principal
+            QTimer.singleShot(0, self._on_login_success)
+
+        except FileNotFoundError as e:
+            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error Fatal", str(e)))
+        except Exception as e:
+            print(f"Error de Login con Google: {e}")
+            QTimer.singleShot(0, self._on_login_failure)
+
+    @Slot()
+    def _on_login_success(self):
+        self._set_status("¡Conectado a Google Drive!")
+
+        # Actualizar botón de conexión
+        self.btn_gdrive.setText("Conectado ✅")
+        self.btn_gdrive.setEnabled(False)
+        self.btn_gdrive.setStyleSheet("background-color: #34a853; color: white; padding: 12px; font-weight: bold;")
+
+        # --- CAMBIO IMPORTANTE: Mostrar siempre el botón de cambiar carpeta ---
+        # Así, si el usuario cancela el diálogo de selección, puede volver a abrirlo.
+        self.btn_change_folder.setVisible(True)
+        # ----------------------------------------------------------------------
+
+        # Inicializar el Manager real para usar la API
+        try:
+            self.drive_manager = DriveManager()
+            self.drive_manager.authenticate() # Ya tiene el token, será rápido
+
+            # Verificar si ya tenemos carpeta configurada
+            folder_id = config_manager.get_drive_folder_id()
+
+            if folder_id:
+                self._set_status(f"Escaneando carpeta guardada...")
+                # Iniciamos escaneo en hilo aparte o directo
+                threading.Thread(target=self._scan_drive_content, args=(folder_id,), daemon=True).start()
+            else:
+                # Si no hay carpeta, pedimos al usuario que elija
+                self._select_drive_folder()
+
+        except Exception as e:
+            print(f"Error post-login: {e}")
+            self._set_status(f"Error inicializando Drive: {e}")
+
+    def _select_drive_folder(self):
+        """Abre el navegador de carpetas de Drive."""
+        # No listamos aquí, dejamos que el diálogo lo haga
+        try:
+            # Pasamos el gestor completo al diálogo
+            dialog = DriveFolderDialog(self.drive_manager, self)
+            result = dialog.exec()
+
+            if result == QDialog.Accepted:
+                folder_id = dialog.selected_folder_id
+                folder_name = dialog.selected_folder_name
+
+                # Guardar configuración
+                config_manager.set_drive_folder_id(folder_id)
+                self.btn_change_folder.setVisible(True)
+                self.btn_change_folder.setText(f"Carpeta: {folder_name} (Cambiar)")
+
+                self._set_status(f"Escaneando carpeta: {folder_name}...")
+
+                # Iniciar escaneo
+                threading.Thread(target=self._scan_drive_content, args=(folder_id,), daemon=True).start()
+
+            dialog.deleteLater()
+
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"Error al abrir navegador de Drive: {e}")
+
+    def _scan_drive_content(self, folder_id):
+        """Inicia el escaneo de Drive."""
+
+        # Limpiar datos de memoria y reiniciar contador
+        self.drive_photos_by_date = {}
+        self.cloud_photo_count = 0  # <--- NUEVO: Contador para la barra de estado
+
+        self._set_status("Conectando con la nube...")
+
+        # Configurar Hilo y Worker (Igual que antes)
+        self.drive_scan_thread = QThread()
+        self.drive_scan_worker = DriveScanWorker(folder_id)
+        self.drive_scan_worker.moveToThread(self.drive_scan_thread)
+
+        self.drive_scan_thread.started.connect(self.drive_scan_worker.run)
+        self.drive_scan_worker.items_found.connect(self._add_drive_items)
+        self.drive_scan_worker.progress.connect(self._set_status)
+
+        # --- CAMBIO IMPORTANTE: Pintar SOLO cuando termine ---
+        self.drive_scan_worker.finished.connect(self._on_drive_scan_finished)
+        # ---------------------------------------------------
+
+        self.drive_scan_worker.finished.connect(self.drive_scan_thread.quit)
+        self.drive_scan_worker.finished.connect(self.drive_scan_worker.deleteLater)
+        self.drive_scan_thread.finished.connect(self.drive_scan_thread.deleteLater)
+
+        self.drive_scan_thread.start()
+
+    @Slot(int)
+    def _on_drive_scan_finished(self, total_count):
+        """Se llama cuando termina todo el escaneo. AQUÍ pintamos la interfaz."""
+
+        self._set_status(f"Procesando visualización de {self.cloud_photo_count} fotos...")
+
+        # Truco para evitar parpadeo blanco mientras se generan los widgets
+        self.cloud_scroll_area.setUpdatesEnabled(False)
+
+        # Pintar todas las fotos de golpe
+        self._display_cloud_photos()
+
+        # Reactivar la visualización
+        self.cloud_scroll_area.setUpdatesEnabled(True)
+
+        if self.cloud_photo_count == 0:
+             from PySide6.QtWidgets import QMessageBox
+             QMessageBox.information(self, "Aviso", "No se encontraron imágenes.")
+
+        self._set_status(f"Escaneo finalizado. {self.cloud_photo_count} fotos listas.")
+
+    @Slot(list)
+    def _add_drive_items(self, items):
+        """
+        Acumula las fotos en memoria PERO NO REFRESCA LA PANTALLA
+        para evitar el parpadeo constante.
+        """
+        count_new = 0
+
+        # 1. Clasificar en memoria
+        for f in items:
+            created_time = f.get('createdTime', '')
+            year = "Sin Fecha"
+            month = "00"
+
+            if created_time:
+                try:
+                    # Drive devuelve ISO formato: 2023-05-12T...
+                    dt = datetime.datetime.strptime(created_time[:10], "%Y-%m-%d")
+                    year = str(dt.year)
+                    month = f"{dt.month:02d}"
+                except:
+                    pass
+
+            if year not in self.drive_photos_by_date:
+                self.drive_photos_by_date[year] = {}
+            if month not in self.drive_photos_by_date[year]:
+                self.drive_photos_by_date[year][month] = []
+
+            self.drive_photos_by_date[year][month].append(f)
+            count_new += 1
+
+        # 2. Actualizar solo el TEXTO de estado (mucho más rápido)
+        self.cloud_photo_count += count_new
+        self._set_status(f"Analizando nube... {self.cloud_photo_count} fotos encontradas.")
+
+        # ¡IMPORTANTE! NO llamamos a self._display_cloud_photos() aquí.
+
+    def _display_cloud_photos(self):
+        """Dibuja la interfaz de Nube agrupada por fechas."""
+
+        # Limpiar layout anterior
+        while self.cloud_container_layout.count() > 0:
+            item = self.cloud_container_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        self.cloud_date_tree.clear()
+        self.cloud_group_widgets = {}
+
+        # Ordenar años descendente (2025, 2024...)
+        sorted_years = sorted(self.drive_photos_by_date.keys(), reverse=True)
+
+        for year in sorted_years:
+            # Item del Árbol
+            year_item = QTreeWidgetItem(self.cloud_date_tree, [str(year)])
+
+            # Etiqueta del Año en el Scroll
+            year_label = QLabel(f"Año {year}")
+            year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; color: #3daee9;")
+            self.cloud_container_layout.addWidget(year_label)
+            self.cloud_group_widgets[str(year)] = year_label
+
+            sorted_months = sorted(self.drive_photos_by_date[year].keys(), reverse=True)
+
+            for month in sorted_months:
+                photos = self.drive_photos_by_date[year][month]
+                if not photos: continue
+
+                # Nombre del mes
+                try:
+                    month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
+                except:
+                    month_name = "Desconocido" if month == "00" else month
+
+                # Item del mes en el árbol
+                month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(photos)})"])
+                month_item.setData(0, Qt.UserRole, f"{year}-{month}")
+
+                # Etiqueta del Mes
+                month_label = QLabel(month_name)
+                month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
+                self.cloud_container_layout.addWidget(month_label)
+                self.cloud_group_widgets[f"{year}-{month}"] = month_label
+
+                # --- LISTA DE FOTOS (PreviewListWidget) ---
+                list_widget = PreviewListWidget()
+                list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                list_widget.setMovement(QListWidget.Static)
+                list_widget.setViewMode(QListWidget.IconMode)
+                list_widget.setResizeMode(QListWidget.Adjust)
+                list_widget.setIconSize(QSize(128, 128))
+                list_widget.setSpacing(10)
+                list_widget.setFrameShape(QFrame.NoFrame) # Queda más limpio
+
+                # CONEXIONES CRÍTICAS
+                list_widget.previewRequested.connect(self._on_drive_preview_requested)
+                # Nota: Para doble clic usamos la misma señal previewRequested
+
+                # Añadir fotos a la lista
+                for f in photos:
+                    item = QListWidgetItem("Cargando...")
+                    item.setToolTip(f['name'])
+
+                    # Datos seguros para evitar crash
+                    safe_data = {
+                        'id': str(f['id']),
+                        'name': str(f['name']),
+                        'mimeType': f.get('mimeType',''),
+                        'thumbnailLink': f.get('thumbnailLink',''),
+                        'webContentLink': f.get('webContentLink','')
+                    }
+                    item.setData(Qt.UserRole, safe_data)
+                    item.setData(Qt.UserRole + 1, "not_loaded") # Estado para lazy load
+                    item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+
+                    list_widget.addItem(item)
+
+                # Calcular altura para que no tenga scroll interno
+                list_widget.setFixedHeight(self._calculate_list_height(len(photos), 128, self.cloud_scroll_area.viewport().width()))
+
+                self.cloud_container_layout.addWidget(list_widget)
+
+            year_item.setExpanded(True)
+
+        self.cloud_container_layout.addStretch(1)
+
+        # Cargar miniaturas iniciales
+        QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _scroll_to_cloud_item(self, current, previous):
+        """Navegación rápida al hacer clic en el árbol de fechas."""
+        if not current: return
+
+        key = ""
+        if current.parent(): # Es un mes
+            key = current.data(0, Qt.UserRole) # "2023-05"
+        else: # Es un año
+            key = current.text(0) # "2023"
+
+        target_widget = self.cloud_group_widgets.get(key)
+        if target_widget:
+            self.cloud_scroll_area.ensureWidgetVisible(target_widget, 0, 0)
+            # Forzar carga de miniaturas en la nueva posición
+            QTimer.singleShot(200, self._load_visible_cloud_thumbnails)
+
+    # ----------------------------------------------------------------------
+    # FUNCIONES AUXILIARES QUE FALTAN (Pegar dentro de VisageVaultApp)
+    # ----------------------------------------------------------------------
+
+    def _calculate_list_height(self, num_items, icon_size, viewport_width):
+        """Calcula la altura necesaria para una lista sin scrollbar."""
+        # Ajuste de márgenes (icono + padding)
+        item_w = icon_size + 20
+        item_h = icon_size + 40
+
+        # Columnas que caben en el ancho actual
+        cols = max(1, (viewport_width - 30) // item_w)
+
+        # Filas necesarias
+        rows = (num_items + cols - 1) // cols
+
+        return rows * item_h
+
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _scroll_to_cloud_item(self, current, previous):
+        """Navegación rápida al hacer clic en el árbol de fechas."""
+        if not current: return
+
+        key = ""
+        if current.parent(): # Es un mes
+            key = current.data(0, Qt.UserRole) # "2023-05"
+        else: # Es un año
+            key = current.text(0) # "2023"
+
+        target_widget = self.cloud_group_widgets.get(key)
+
+        # Validar que el widget existe y es visible para evitar errores C++
+        if target_widget:
+            try:
+                self.cloud_scroll_area.ensureWidgetVisible(target_widget, 0, 0)
+                # Forzar carga de miniaturas en la nueva posición tras un breve retraso
+                QTimer.singleShot(200, self._load_visible_cloud_thumbnails)
+            except RuntimeError:
+                pass
+
+    def _load_visible_cloud_thumbnails(self):
+        """Carga SOLO las miniaturas que se ven en pantalla (Nube)."""
+        viewport = self.cloud_scroll_area.viewport()
+        preload_rect = viewport.rect().adjusted(0, -500, 0, 500) # Precarga 500px arriba/abajo
+
+        widget_contenedor = self.cloud_scroll_area.widget()
+        if not widget_contenedor: return
+
+        # Buscar todas las listas dentro del área de nube
+        for list_widget in widget_contenedor.findChildren(PreviewListWidget):
+
+            # Si la lista no está visible, saltarla
+            if not list_widget.isVisible(): continue
+
+            # Coordenadas relativas al viewport
+            pos = list_widget.mapTo(viewport, list_widget.rect().topLeft())
+            rect = list_widget.rect().translated(pos)
+
+            # Si la lista cruza el área visible (+ margen)
+            if preload_rect.intersects(rect):
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    # Si no está cargada ni cargando...
+                    if item.data(Qt.UserRole + 1) == "not_loaded":
+                        data = item.data(Qt.UserRole)
+                        thumb_link = data.get('thumbnailLink')
+                        file_id = data.get('id')
+
+                        if thumb_link and file_id:
+                            item.setData(Qt.UserRole + 1, "loading")
+                            # Usamos el NetworkThumbnailLoader
+                            worker = NetworkThumbnailLoader(thumb_link, file_id, self.thumb_signals)
+                            self.threadpool.start(worker)
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""
