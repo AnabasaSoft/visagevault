@@ -133,5 +133,5 @@ Selecciona uno o varios elementos y haz clic derecho para acceder a las opciones
 | **Selección de Rango** | `Shift` + `Clic` |
 | **Selección por Arrastre** | Clic izquierdo y arrastrar sobre el fondo gris |
 
-````
+
 ````
