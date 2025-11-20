@@ -61,8 +61,10 @@ La librería `face_recognition` y `rawpy` requieren herramientas de compilación
 * **Linux:** `cmake`, `gcc`, `libarchive-tools` (para empaquetado).
   ```bash
   sudo apt install build-essential cmake libopenblas-dev liblapack-dev ffmpeg libarchive-tools
+  ```
+
 * **Mac:** Xcode command line tools.
-```
+
 ### Librerías Python
 
 Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clave son:
@@ -133,3 +135,4 @@ Selecciona uno o varios elementos y haz clic derecho para acceder a las opciones
 
 ```
 ```
+````
