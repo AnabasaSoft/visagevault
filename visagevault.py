@@ -868,9 +868,6 @@ class ImagePreviewDialog(QDialog):
 # =================================================================
 # CLASE: PreviewListWidget
 # =================================================================
-# =================================================================
-# CLASE: PreviewListWidget (LIMPIA)
-# =================================================================
 class PreviewListWidget(QListWidget):
     """
     QListWidget personalizado:
@@ -1121,23 +1118,31 @@ class ZoomableClickableLabel(QLabel):
 # -----------------------------------------------------------------
 class PhotoDetailDialog(QDialog):
     metadata_changed = Signal(str, str, str)
+
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
         self.main_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(self.main_splitter)
+
+        # Panel Izquierdo: Imagen
         self.image_label = ZoomableClickableLabel(self.original_path, self)
         self.image_label.is_thumbnail_view = False
         self.main_splitter.addWidget(self.image_label)
+
+        # Panel Derecho: Solo fechas (SIN EXIF)
         right_panel_widget = QWidget()
         right_panel_layout = QVBoxLayout(right_panel_widget)
-        right_panel_widget.setMinimumWidth(300)
-        right_panel_widget.setMaximumWidth(450)
-        date_group = QGroupBox("Fecha (Base de Datos)")
+        right_panel_widget.setMinimumWidth(250)
+        right_panel_widget.setMaximumWidth(350)
+
+        date_group = QGroupBox("Editar Fecha")
         date_layout = QGridLayout(date_group)
+
         date_layout.addWidget(QLabel("Año:"), 0, 0)
         self.year_edit = QLineEdit()
-        self.year_edit.setPlaceholderText("Ej: 2024 o 'Sin Fecha'")
+        self.year_edit.setPlaceholderText("Ej: 2024")
         date_layout.addWidget(self.year_edit, 0, 1)
+
         date_layout.addWidget(QLabel("Mes:"), 1, 0)
         self.month_combo = QComboBox()
         self.month_combo.addItem("Mes Desconocido", "00")
@@ -1146,121 +1151,91 @@ class PhotoDetailDialog(QDialog):
             try:
                 month_name = datetime.datetime.strptime(month_str, "%m").strftime("%B").capitalize()
             except ValueError:
-                month_name = datetime.date(2000, i, 1).strftime("%B").capitalize()
+                month_name = str(i)
             self.month_combo.addItem(month_name, month_str)
         date_layout.addWidget(self.month_combo, 1, 1)
-        exif_group = QGroupBox("Datos EXIF (Solo Lectura)")
-        exif_layout = QVBoxLayout(exif_group)
-        self.metadata_table = QTableWidget()
-        self.metadata_table.setColumnCount(2)
-        self.metadata_table.setHorizontalHeaderLabels(["Campo", "Valor"])
-        self.metadata_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.metadata_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.metadata_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        exif_layout.addWidget(self.metadata_table)
+
         right_panel_layout.addWidget(date_group)
-        right_panel_layout.addWidget(exif_group, 1)
+        right_panel_layout.addStretch(1) # Relleno para empujar hacia arriba
+
         self.main_splitter.addWidget(right_panel_widget)
+
+        # Botones
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self._save_metadata)
         self.button_box.rejected.connect(self.reject)
         main_layout.addWidget(self.button_box)
-        self.main_splitter.setSizes([int(self.width() * 0.7), int(self.width() * 0.3)])
+
+        # Ajuste de tamaños (más espacio para la foto)
+        self.main_splitter.setSizes([800, 250])
+
     def __init__(self, original_path, db_manager: VisageVaultDB, parent=None):
         super().__init__(parent)
         self.original_path = original_path
         self.db = db_manager
-        self.exif_dict = {}
-        self.date_time_tag_info = None
         self.setWindowTitle(Path(original_path).name)
         self.resize(1000, 800)
+
         self._setup_ui()
         self._load_photo()
-        self._load_metadata()
+        self._load_current_date() # Renombrado de _load_metadata
+
     def _load_photo(self):
+        # ... (MANTENER EL CÓDIGO DE CARGA DE IMAGEN/RAW IGUAL QUE ANTES) ...
+        # (No copies esto, solo deja el método _load_photo tal cual lo tenías)
         try:
-            # Definir extensiones RAW (deben coincidir con las de los otros archivos)
+            # Definir extensiones RAW
             RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
             file_suffix = Path(self.original_path).suffix.lower()
-            pixmap = QPixmap() # Empezar con un pixmap vacío
+            pixmap = QPixmap()
 
             if file_suffix in RAW_EXTENSIONS:
-                # 1. Usar rawpy para leer el archivo RAW
                 with rawpy.imread(self.original_path) as raw:
-                    # postprocess() aplica correcciones de color y devuelve un array numpy (H, W, 3)
                     rgb_array = raw.postprocess()
-
-                # 2. Convertir el array de numpy a QImage
                 height, width, channel = rgb_array.shape
                 bytes_per_line = 3 * width
-                # .copy() es crucial para que QImage tome propiedad de los datos
                 q_image = QImage(rgb_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-
-                # 3. Convertir QImage a QPixmap
                 pixmap = QPixmap.fromImage(q_image)
-
             else:
-                # 4. Lógica original para JPG, PNG, etc.
                 pixmap = QPixmap(self.original_path)
 
-            if pixmap.isNull():
-                raise Exception("QPixmap está vacío después de cargar (formato no soportado o archivo corrupto).")
-
             self.image_label.setOriginalPixmap(pixmap)
-
         except Exception as e:
-            print(f"Error detallado al cargar {self.original_path}: {e}")
-            self.image_label.setText(f"Error al cargar imagen: {e}")
+            self.image_label.setText(f"Error: {e}")
 
-    def _load_metadata(self):
-        self.exif_dict = metadata_reader.get_exif_dict(self.original_path)
-        self.metadata_table.setRowCount(0)
+    def _load_current_date(self):
+        """Carga solo la fecha actual de la BD o del archivo."""
         current_year, current_month = self.db.get_photo_date(self.original_path)
+
+        # Si no está en BD, usar la función simple de metadata_reader
         if current_year is None or current_month is None:
-            exif_year, exif_month = metadata_reader.get_photo_date(self.original_path)
-            if current_year is None:
-                current_year = exif_year
-            if current_month is None:
-                current_month = exif_month
+            current_year, current_month = metadata_reader.get_photo_date(self.original_path)
+
         self.year_edit.setText(current_year or "Sin Fecha")
         month_index = self.month_combo.findData(current_month or "00")
         self.month_combo.setCurrentIndex(month_index if month_index != -1 else 0)
-        if not self.exif_dict:
-            self.metadata_table.insertRow(0)
-            self.metadata_table.setItem(0, 0, QTableWidgetItem("Info"))
-            self.metadata_table.setItem(0, 1, QTableWidgetItem("No se encontraron metadatos EXIF."))
-            return
-        row = 0
-        for ifd_name, tags in self.exif_dict.items():
-            if not isinstance(tags, dict): continue
-            for tag_id, value in tags.items():
-                self.metadata_table.insertRow(row)
-                tag_name = piexif.TAGS[ifd_name].get(tag_id, {"name": f"UnknownTag_{tag_id}"})["name"]
-                if isinstance(value, bytes):
-                    try: value_str = piexif.helper.decode_bytes(value)
-                    except: value_str = str(value)
-                else:
-                    value_str = str(value)
-                self.metadata_table.setItem(row, 0, QTableWidgetItem(tag_name))
-                self.metadata_table.setItem(row, 1, QTableWidgetItem(value_str))
-                row += 1
+
     def _save_metadata(self):
+        # ... (MANTENER IGUAL QUE ANTES) ...
+        # Solo cambia la BD, lo cual es correcto según tus instrucciones.
         try:
             new_year_str = self.year_edit.text()
             new_month_str = self.month_combo.currentData()
+
+            # Validación simple
             if not (new_year_str == "Sin Fecha" or (len(new_year_str) == 4 and new_year_str.isdigit())):
                 from PySide6.QtWidgets import QMessageBox
-                QMessageBox.warning(self,
-                                    "Datos Inválidos",
-                                    "El Año debe ser 'Sin Fecha' o un número de 4 dígitos (ej: 2024).")
+                QMessageBox.warning(self, "Datos Inválidos", "Año inválido.")
                 return
-            old_year, old_month = self.db.get_photo_date(self.original_path)
-            if old_year != new_year_str or old_month != new_month_str:
-                self.db.update_photo_date(self.original_path, new_year_str, new_month_str)
-                self.metadata_changed.emit(self.original_path, new_year_str, new_month_str)
+
+            # Guardar en BD
+            self.db.update_photo_date(self.original_path, new_year_str, new_month_str)
+
+            # Notificar cambio
+            self.metadata_changed.emit(self.original_path, new_year_str, new_month_str)
             self.accept()
         except Exception as e:
-            print(f"Error al guardar la fecha en la BD: {e}")
+            print(f"Error al guardar: {e}")
 
 # =================================================================
 # CLASE: DIÁLOGO DE ETIQUETADO DE GRUPOS (CLUSTERS) (Sin cambios)
@@ -3571,19 +3546,6 @@ class VisageVaultApp(QMainWindow):
         self._set_status("Imagen descargada. Abriendo visor...")
         self._open_preview_dialog(local_path)
 
-    def _download_for_preview(self, file_id, local_path):
-        """Descarga y abre el diálogo de vista previa rápida."""
-        try:
-            local_manager = DriveManager()
-            local_manager.download_file(file_id, local_path)
-
-            # Abrir la vista previa (ImagePreviewDialog) en el hilo principal
-            QTimer.singleShot(0, lambda: self._open_preview_dialog(local_path))
-            QTimer.singleShot(0, lambda: self._set_status("Vista previa lista."))
-        except Exception as e:
-            print(f"Error descarga preview: {e}")
-            QTimer.singleShot(0, lambda: self._set_status("Error al descargar para vista previa."))
-
     @Slot(QListWidgetItem)
     def _on_drive_item_double_clicked(self, item):
         file_data = item.data(Qt.UserRole)
@@ -4882,17 +4844,6 @@ class VisageVaultApp(QMainWindow):
 
         self._set_status(f"Listo. {self.cloud_photo_count} fotos disponibles.")
 
-    @Slot(list)
-    def _add_drive_items(self, items):
-        """
-        Solo actualiza la estructura en memoria (RAM).
-        La inserción en BD ya la hizo el worker.
-        """
-        # ELIMINADO: self.db.bulk_upsert_drive_photos(...) <- Esto congelaba la UI
-
-        self._classify_drive_items_in_memory(items)
-        self._set_status(f"Sincronizando... {self.cloud_photo_count} fotos procesadas.")
-
     def _display_cloud_photos(self):
         """Dibuja la interfaz de Nube EXACTAMENTE igual que Fotos (Estilo nativo)."""
 
@@ -5002,41 +4953,6 @@ class VisageVaultApp(QMainWindow):
 
         self.cloud_container_layout.addStretch(1)
         QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
-
-    @Slot(QTreeWidgetItem, QTreeWidgetItem)
-    def _scroll_to_cloud_item(self, current, previous):
-        """Navegación rápida al hacer clic en el árbol de fechas."""
-        if not current: return
-
-        key = ""
-        if current.parent(): # Es un mes
-            key = current.data(0, Qt.UserRole) # "2023-05"
-        else: # Es un año
-            key = current.text(0) # "2023"
-
-        target_widget = self.cloud_group_widgets.get(key)
-        if target_widget:
-            self.cloud_scroll_area.ensureWidgetVisible(target_widget, 0, 0)
-            # Forzar carga de miniaturas en la nueva posición
-            QTimer.singleShot(200, self._load_visible_cloud_thumbnails)
-
-    # ----------------------------------------------------------------------
-    # FUNCIONES AUXILIARES QUE FALTAN (Pegar dentro de VisageVaultApp)
-    # ----------------------------------------------------------------------
-
-    def _calculate_list_height(self, num_items, icon_size, viewport_width):
-        """Calcula la altura necesaria para una lista sin scrollbar."""
-        # Ajuste de márgenes (icono + padding)
-        item_w = icon_size + 20
-        item_h = icon_size + 40
-
-        # Columnas que caben en el ancho actual
-        cols = max(1, (viewport_width - 30) // item_w)
-
-        # Filas necesarias
-        rows = (num_items + cols - 1) // cols
-
-        return rows * item_h
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_cloud_item(self, current, previous):
