@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.6.1
+# VERSIÓN: 1.6.5
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -91,9 +91,19 @@ from db_manager import VisageVaultDB
 import face_recognition
 from PIL import Image
 import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import shutil
 import hashlib
+from functools import lru_cache
+
+# --- FUNCIÓN GLOBAL DE CACHÉ EN RAM ---
+# Guarda las últimas 500 imágenes en memoria para que el scroll sea instantáneo
+@lru_cache(maxsize=500)
+def get_cached_pixmap(filepath: str) -> QPixmap:
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        return QPixmap(filepath)
+    return QPixmap()
 
 def resource_path(relative_path):
     """Obtiene la ruta absoluta al recurso tanto en PyInstaller como en desarrollo."""
@@ -125,8 +135,6 @@ class ThumbnailLoaderSignals(QObject):
 # CLASE PARA CARGAR MINIATURAS DE IMAGEN (QRunnable)
 # =================================================================
 class ThumbnailLoader(QRunnable):
-    """QRunnable para cargar una miniatura de IMAGEN de forma asíncrona."""
-
     def __init__(self, original_filepath: str, signals: ThumbnailLoaderSignals):
         super().__init__()
         self.original_filepath = original_filepath
@@ -134,13 +142,17 @@ class ThumbnailLoader(QRunnable):
 
     @Slot()
     def run(self):
-        # --- MODIFICADO: Llama a la función específica de IMAGEN ---
+        # 1. Generar si no existe (esto escribe en disco)
         thumbnail_path = generate_image_thumbnail(self.original_filepath)
-        # --- FIN DE MODIFICACIÓN ---
+
         if thumbnail_path:
             try:
-                pixmap = QPixmap(thumbnail_path)
-                self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                # 2. Cargar usando CACHÉ DE RAM (¡Mucho más rápido!)
+                pixmap = get_cached_pixmap(thumbnail_path)
+                if not pixmap.isNull():
+                    self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                else:
+                    self.signals.load_failed.emit(self.original_filepath)
             except Exception:
                 self.signals.load_failed.emit(self.original_filepath)
         else:
@@ -150,8 +162,6 @@ class ThumbnailLoader(QRunnable):
 # CLASE PARA CARGAR MINIATURAS DE VÍDEO (QRunnable) - ¡NUEVA!
 # =================================================================
 class VideoThumbnailLoader(QRunnable):
-    """QRunnable para cargar una miniatura de VÍDEO de forma asíncrona."""
-
     def __init__(self, original_filepath: str, signals: ThumbnailLoaderSignals):
         super().__init__()
         self.original_filepath = original_filepath
@@ -159,13 +169,15 @@ class VideoThumbnailLoader(QRunnable):
 
     @Slot()
     def run(self):
-        # --- MODIFICADO: Llama a la función específica de VÍDEO ---
         thumbnail_path = generate_video_thumbnail(self.original_filepath)
-        # --- FIN DE MODIFICACIÓN ---
         if thumbnail_path:
             try:
-                pixmap = QPixmap(thumbnail_path)
-                self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                # Usar Caché RAM
+                pixmap = get_cached_pixmap(thumbnail_path)
+                if not pixmap.isNull():
+                    self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                else:
+                    self.signals.load_failed.emit(self.original_filepath)
             except Exception:
                 self.signals.load_failed.emit(self.original_filepath)
         else:
@@ -175,78 +187,43 @@ class VideoThumbnailLoader(QRunnable):
 # CLASE: NetworkThumbnailLoader (CON CACHÉ EN DISCO)
 # =================================================================
 class NetworkThumbnailLoader(QRunnable):
-    """
-    1. Mira si la miniatura ya existe en disco.
-    2. Si existe, la carga al instante.
-    3. Si no, la descarga, la guarda en disco y luego la carga.
-    """
     def __init__(self, url, file_id, signals):
         super().__init__()
         self.url = url
         self.file_id = file_id
         self.signals = signals
 
-        # Definir ruta de caché específica para Drive
-        # Usamos .visagevault_cache/drive_thumbnails
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        # visagevault_cache/drive_snapshot_cache
         self.cache_dir = os.path.join(base_dir, "visagevault_cache", "drive_snapshot_cache")
-
         if not os.path.exists(self.cache_dir):
             try: os.makedirs(self.cache_dir)
             except: pass
 
-        # Crear carpeta si no existe (hilo seguro porque makedirs es atómico o lanza error tolerable)
-        if not os.path.exists(self.cache_dir):
-            try:
-                os.makedirs(self.cache_dir)
-            except OSError:
-                pass # Ya existía
-
     @Slot()
     def run(self):
-        # Ruta del archivo: Usamos el ID de Google como nombre único
         cache_path = os.path.join(self.cache_dir, f"{self.file_id}.jpg")
 
-        # --- 1. INTENTO DE CARGA DESDE CACHÉ (RÁPIDO) ---
-        if os.path.exists(cache_path):
-            # Verificar que no sea un archivo corrupto de 0 bytes
-            if os.path.getsize(cache_path) > 0:
-                try:
-                    pixmap = QPixmap(cache_path)
-                    if not pixmap.isNull():
-                        self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
-                        return
-                except Exception:
-                    pass # Si falla la carga local, intentamos descargar de nuevo
+        # 1. INTENTO CACHÉ DISCO + RAM
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+            pixmap = get_cached_pixmap(cache_path) # <--- RAM CACHE
+            if not pixmap.isNull():
+                self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
+                return
 
-            # Si llegamos aquí es que el archivo estaba corrupto o vacío
-            try: os.remove(cache_path)
-            except: pass
-
-        # --- 2. DESCARGA DE LA RED (LENTO) ---
-        if not self.url:
-            return
+        # 2. DESCARGA
+        if not self.url: return
 
         try:
-            # Descargar
             response = requests.get(self.url, timeout=10)
-
             if response.status_code == 200:
-                # 1. Guardar en disco para la próxima vez
                 with open(cache_path, 'wb') as f:
                     f.write(response.content)
 
-                # 2. Cargar en memoria para mostrar ahora
-                pixmap = QPixmap()
-                pixmap.loadFromData(response.content)
-
+                # Cargar en memoria y cachear
+                pixmap = get_cached_pixmap(cache_path) # <--- Se guarda en LRU Cache al leer
                 if not pixmap.isNull():
                     self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
-
-        except Exception as e:
-            # Si falla, no pasa nada, se queda con el icono de "Cargando" o genérico
-            # print(f"Error descargando thumb {self.file_id}: {e}")
+        except Exception:
             pass
 
 class DriveFolderDialog(QDialog):
@@ -1616,7 +1593,7 @@ class VideoFinderWorker(QObject):
             self.finished.emit(videos_by_year_month)
 
 # =================================================================
-# CLASE TRABAJADORA DEL ESCANEO DE CARAS (¡CON SOPORTE RAW!)
+# CLASE TRABAJADORA DEL ESCANEO DE CARAS (CIERRE SEGURO)
 # =================================================================
 class FaceScanSignals(QObject):
     scan_progress = Signal(str)
@@ -1630,111 +1607,154 @@ class FaceScanWorker(QObject):
         self.db_path = db_path
         self.signals = FaceScanSignals()
         self.is_running = True
+        self.executor = None # Referencia para poder matarlo desde fuera
+
+    def stop(self):
+        """Fuerza la detención inmediata de los hilos."""
+        self.is_running = False
+        if self.executor:
+            # wait=False: No esperar a que terminen las tareas pendientes
+            # cancel_futures=True: Cancelar las que están en cola (Python 3.9+)
+            print("🛑 Forzando apagado del motor de IA...")
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
     @Slot()
     def run(self):
         local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
         local_db.db_path = self.db_path
         local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-
-        # Intentamos poner esto por si acaso, pero usaremos índices numéricos para asegurar
         local_db.conn.row_factory = sqlite3.Row
         local_db.conn.execute("PRAGMA journal_mode=WAL;")
 
         try:
             self.signals.scan_progress.emit("Buscando fotos sin escanear...")
             unscanned_photos = local_db.get_unscanned_photos()
-
             total = len(unscanned_photos)
+
             if total == 0:
-                self.signals.scan_progress.emit("No hay fotos nuevas para analizar.")
+                self.signals.scan_progress.emit("No hay fotos nuevas.")
                 self.signals.scan_percentage.emit(100)
                 self.signals.scan_finished.emit()
                 return
 
-            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
-            RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
+            self.signals.scan_progress.emit(f"Escaneando {total} fotos...")
 
-            for i, row in enumerate(unscanned_photos):
-                if not self.is_running: break
+            # WARMUP
+            try:
+                import face_recognition
+                dummy = np.zeros((50, 50, 3), dtype=np.uint8)
+                face_recognition.face_locations(dummy, model="hog")
+            except Exception: pass
 
-                # --- CAMBIO BLINDADO AQUÍ ---
-                # Usamos índices numéricos. Esto funciona SIEMPRE (tupla o Row)
-                # La consulta SQL es "SELECT id, filepath...", así que:
-                # 0 = id
-                # 1 = filepath
-                photo_id = row[0]
-                photo_path = row[1]
-                # ----------------------------
+            max_workers = 1 # max_workers = min(4, os.cpu_count() or 2)
+            processed_count = 0
 
-                if i % 5 == 0:
-                    percentage = (i + 1) * 100 // total
-                    self.signals.scan_percentage.emit(percentage)
-                    self.signals.scan_progress.emit(f"Analizando caras ({i+1}/{total})...")
-                    time.sleep(0.001)
+            # Guardamos el executor en self para poder matarlo en stop()
+            self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
-                try:
-                    image = None
-                    file_suffix = Path(photo_path).suffix.lower()
+            with self.executor:
+                future_to_photo = {}
+                for row in unscanned_photos:
+                    if not self.is_running: break
+                    p_id = row['id']
+                    p_path = row['filepath']
 
-                    if file_suffix in RAW_EXTENSIONS:
-                        try:
-                            with rawpy.imread(photo_path) as raw:
-                                image = raw.postprocess()
-                        except Exception:
-                            local_db.mark_photo_as_scanned(photo_id)
-                            continue
-                    else:
-                        image = face_recognition.load_image_file(photo_path)
+                    future = self.executor.submit(self._process_single_image, p_id, p_path)
+                    future_to_photo[future] = (p_id, p_path)
 
-                    if image is None:
+                for future in as_completed(future_to_photo):
+                    if not self.is_running:
+                        # Si nos mandan parar, rompemos el bucle
+                        break
+
+                    photo_id, photo_path = future_to_photo[future]
+                    try:
+                        # Timeout pequeño para no bloquear eternamente si se cierra la app
+                        result_data = future.result(timeout=0.1)
+
+                        if result_data:
+                            for (encoding_blob, location_str) in result_data:
+                                face_db_id = local_db.add_face(photo_id, encoding_blob, location_str)
+                                self.signals.face_found.emit(face_db_id, photo_path, location_str)
+
                         local_db.mark_photo_as_scanned(photo_id)
-                        continue
 
-                    # Redimensionar para velocidad
-                    h, w = image.shape[:2]
-                    max_width = 1000
-                    scale_ratio = 1.0
-                    if w > max_width:
-                        scale_ratio = max_width / float(w)
-                        new_h = int(h * scale_ratio)
-                        image = cv2.resize(image, (max_width, new_h))
+                    except TimeoutError:
+                        # Si tarda mucho y estamos cerrando, ignorar
+                        pass
+                    except Exception as e:
+                        # print(f"Error procesando {photo_path}: {e}")
+                        local_db.mark_photo_as_scanned(photo_id)
 
-                    locations = face_recognition.face_locations(image)
+                    processed_count += 1
+                    if processed_count % 5 == 0:
+                        percentage = int((processed_count / total) * 100)
+                        self.signals.scan_percentage.emit(percentage)
+                        self.signals.scan_progress.emit(f"Analizando caras ({processed_count}/{total})...")
 
-                    if locations:
-                        encodings = face_recognition.face_encodings(image, locations)
-                        for loc, enc in zip(locations, encodings):
-                            if scale_ratio != 1.0:
-                                top, right, bottom, left = loc
-                                top = int(top / scale_ratio)
-                                right = int(right / scale_ratio)
-                                bottom = int(bottom / scale_ratio)
-                                left = int(left / scale_ratio)
-                                loc = (top, right, bottom, left)
-
-                            location_str = str(loc)
-                            encoding_blob = pickle.dumps(enc)
-                            face_db_id = local_db.add_face(photo_id, encoding_blob, location_str)
-                            self.signals.face_found.emit(face_db_id, photo_path, location_str)
-
-                    local_db.mark_photo_as_scanned(photo_id)
-
-                except Exception as e:
-                    print(f"Error procesando caras en {photo_path}: {e}")
-                    local_db.mark_photo_as_scanned(photo_id)
-
-            self.signals.scan_progress.emit("Escaneo de caras finalizado.")
             self.signals.scan_finished.emit()
 
         except Exception as e:
-            print(f"Error crítico worker caras: {e}")
-            import traceback
-            traceback.print_exc()
+            # print(f"Worker interrumpido o error: {e}")
             self.signals.scan_finished.emit()
         finally:
+            # Asegurar limpieza final
+            if self.executor:
+                self.executor.shutdown(wait=False)
             try: local_db.conn.close()
             except: pass
+
+    def _process_single_image(self, photo_id, photo_path):
+        # ... (Mantén este método IGUAL que en la versión PIL anterior) ...
+        # (Copia el método _process_single_image de mi respuesta anterior)
+        # Extensiones RAW
+        RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
+
+        try:
+            image = None
+            file_suffix = Path(photo_path).suffix.lower()
+
+            if file_suffix in RAW_EXTENSIONS:
+                try:
+                    with rawpy.imread(photo_path) as raw:
+                        image = raw.postprocess()
+                except Exception:
+                    return None
+            else:
+                image = face_recognition.load_image_file(photo_path)
+
+            if image is None: return None
+
+            h, w = image.shape[:2]
+            max_width = 1000
+            scale_ratio = 1.0
+
+            if w > max_width:
+                scale_ratio = max_width / float(w)
+                new_h = int(h * scale_ratio)
+                pil_image = Image.fromarray(image)
+                pil_image = pil_image.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                image = np.array(pil_image)
+
+            locations = face_recognition.face_locations(image, model="hog")
+            faces_found = []
+
+            if locations:
+                encodings = face_recognition.face_encodings(image, locations)
+                for loc, enc in zip(locations, encodings):
+                    if scale_ratio != 1.0:
+                        top, right, bottom, left = loc
+                        top = int(top / scale_ratio)
+                        right = int(right / scale_ratio)
+                        bottom = int(bottom / scale_ratio)
+                        left = int(left / scale_ratio)
+                        loc = (top, right, bottom, left)
+
+                    faces_found.append((pickle.dumps(enc), str(loc)))
+            return faces_found
+
+        except Exception:
+            return None
 
 # =================================================================
 # CLASE: DIÁLOGO DE AYUDA Y ACERCA DE
@@ -2503,9 +2523,27 @@ class VisageVaultApp(QMainWindow):
         self.resize_timer.timeout.connect(self._handle_resize_timeout)
 
         self._setup_ui()
+
+        # --- PRECARGA INTELIGENTE ---
+        # 1. Configuración inicial
         QTimer.singleShot(100, self._initial_check)
         QTimer.singleShot(500, self._check_auto_login)
 
+        # 2. 🔥 ELIMINAR RETARDO DE PESTAÑAS: Cargar datos pesados al arrancar
+        # Lo lanzamos a los 800ms para no frenar la apertura de la ventana
+        QTimer.singleShot(800, self._preload_heavy_tabs)
+
+    # --- AÑADIR ESTE NUEVO MÉTODO ---
+    def _preload_heavy_tabs(self):
+        """Carga los datos de Personas y Nube en segundo plano al iniciar."""
+        # 1. Cargar lista de nombres de personas (DB Query + TreeWidget)
+        self._load_people_list()
+
+        # 2. Cargar rejilla de caras (DB Query + Widgets)
+        self._load_existing_faces_async()
+
+        # (La Nube ya se precarga sola con _check_auto_login -> _scan_drive_content)
+        self._set_status("Aplicación lista y precargada.")
 
     def _setup_ui(self):
         # 1. Crear el QTabWidget
@@ -2527,7 +2565,7 @@ class VisageVaultApp(QMainWindow):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(photo_area_widget)
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_main_visible_thumbnails)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._debounced_thumbnail_load)
         self.main_splitter.addWidget(self.scroll_area)
 
         # Panel Derecho (Navegación de Fotos)
@@ -2867,13 +2905,23 @@ class VisageVaultApp(QMainWindow):
 
     def _initial_check(self):
         """Comprueba la configuración al arrancar la app."""
+
+        # --- NUEVA COMPROBACIÓN DE AUTOREPARACIÓN ---
+        if self.db.was_reset:
+            QMessageBox.warning(
+                self,
+                "Autoreparación Realizada",
+                "Se detectó un problema en la base de datos y ha sido reiniciada.\n\n"
+                "✅ TUS DATOS ESTÁN A SALVO: Hemos restaurado tus fechas personalizadas y archivos ocultos.\n"
+                "ℹ️ El escáner de caras y miniaturas se ejecutará de nuevo para reconstruir el caché."
+            )
+        # --------------------------------------------
+
         directory = config_manager.get_photo_directory()
         if directory and Path(directory).is_dir():
             self.current_directory = directory
             self.path_label.setText(f"Ruta: {Path(directory).name}")
-            # --- MODIFICADO: Iniciar ambos escaneos ---
             self._start_media_scan(directory)
-            # --- FIN DE MODIFICACIÓN ---
         else:
             self._set_status("No se encontró un directorio válido. Por favor, selecciona uno.")
             self._open_directory_dialog(force_select=True)
@@ -3924,6 +3972,19 @@ class VisageVaultApp(QMainWindow):
         # Usamos la barra de estado nativa de la ventana (visible en todas las pestañas)
         self.statusBar().showMessage(f"Estado: {message}")
 
+    # --- NUEVO MÉTODO PARA SUAVIZAR SCROLL ---
+    def _debounced_thumbnail_load(self):
+        """Espera a que el usuario deje de hacer scroll antes de cargar imágenes."""
+        if hasattr(self, '_thumb_timer') and self._thumb_timer.isActive():
+            self._thumb_timer.stop()
+
+        self._thumb_timer = QTimer()
+        self._thumb_timer.setSingleShot(True)
+        # Esperar 150ms de quietud antes de cargar. Ajusta si lo notas lento.
+        self._thumb_timer.setInterval(150)
+        self._thumb_timer.timeout.connect(self._load_main_visible_thumbnails)
+        self._thumb_timer.start()
+
     def _load_main_visible_thumbnails(self):
         """Carga miniaturas de FOTOS visibles (Refactorizado para QListWidget)."""
         viewport = self.scroll_area.viewport()
@@ -4265,6 +4326,7 @@ class VisageVaultApp(QMainWindow):
             self._display_photos()
         if self.videos_by_year_month:
             self._display_videos()
+        self._reflow_faces()
 
     @Slot(str)
     def _open_photo_detail(self, original_path):
@@ -4374,33 +4436,60 @@ class VisageVaultApp(QMainWindow):
             print(f"Error al intentar abrir el vídeo: {e}")
             self._set_status(f"Error: {e}")
 
+    def _reflow_faces(self):
+        """
+        Reorganiza visualmente todas las caras para ajustarse al ancho actual de la ventana.
+        Corrige la 'columna vertical' creada durante la precarga oculta.
+        """
+        # 1. Calcular cuántas columnas caben REALMENTE ahora
+        viewport_width = self.face_scroll_area.viewport().width() - 30
+        if viewport_width <= 0: return
+
+        new_num_cols = max(1, viewport_width // 110)
+
+        # 2. Extraer todos los widgets de caras existentes
+        faces = []
+        # Usamos un bucle para sacar todo del layout limpiamente
+        while self.unknown_faces_layout.count() > 0:
+            item = self.unknown_faces_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                # Solo guardamos si es una cara válida (evitamos etiquetas de error antiguas)
+                if isinstance(w, CircularFaceLabel) or w.property("face_id"):
+                    faces.append(w)
+                else:
+                    w.deleteLater() # Borrar mensajes viejos tipo "Cargando..."
+
+        # 3. Volver a insertarlos en el orden correcto (Izquierda -> Derecha)
+        for i, face_widget in enumerate(faces):
+            row = i // new_num_cols
+            col = i % new_num_cols
+            self.unknown_faces_layout.addWidget(face_widget, row, col, Qt.AlignTop)
+
+        # 4. Actualizar el contador global para que las NUEVAS caras sigan desde aquí
+        self.current_face_count = len(faces)
+
     @Slot(int)
     def _on_tab_changed(self, index):
-        """Se llama cuando el usuario cambia de pestaña."""
-        # Limpiamos cola de hilos para priorizar lo que se ve ahora
         self.threadpool.clear()
-
         tab_name = self.tab_widget.tabText(index)
 
         if tab_name == "Personas":
-            self._set_status("Cargando vista de personas...")
-            self._load_people_list()
-
-            # NOTA: Ya NO borramos manualmente los widgets aquí.
-            # Dejamos que _load_existing_faces_async decida qué añadir.
+            self._set_status("Mostrando caras...")
 
             if self.face_loading_label:
                 self.face_loading_label.deleteLater()
                 self.face_loading_label = None
 
-            # Cargar caras (modo incremental)
-            # Si vengo de 'Caras Eliminadas', necesito resetear la vista a 'Desconocidas'
+            # --- CORRECCIÓN: REORGANIZAR REJILLA ---
+            # Arregla el desorden causado por la precarga en segundo plano
+            self._reflow_faces()
+            # ---------------------------------------
+
             current_item = self.people_tree_widget.currentItem()
             if current_item and current_item.data(0, Qt.UserRole) == -2:
-                 # Si estaba en eliminadas, aquí no hacemos nada, dejamos que el usuario navegue
                  pass
             else:
-                 # Si estoy en vista normal, cargo lo nuevo
                  self._load_existing_faces_async()
 
             if self.face_scan_thread and self.face_scan_thread.isRunning():
@@ -4409,6 +4498,9 @@ class VisageVaultApp(QMainWindow):
         elif tab_name == "Caja Fuerte":
             if hasattr(self, 'unlocked_widget') and self.unlocked_widget.isVisible():
                 self._load_safe_content()
+
+        elif tab_name == "Nube":
+            QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
 
     def _load_people_list(self):
         self.people_tree_widget.clear()
@@ -4430,7 +4522,6 @@ class VisageVaultApp(QMainWindow):
     def _populate_face_grid_async(self, face_list: list, is_deleted_view: bool = False, append: bool = False):
         """Rellena la rejilla de caras de forma robusta e incremental."""
 
-        # Si NO es append (es una carga total), limpiamos todo
         if not append:
             while self.unknown_faces_layout.count() > 0:
                 item = self.unknown_faces_layout.takeAt(0)
@@ -4443,11 +4534,9 @@ class VisageVaultApp(QMainWindow):
                 self.unknown_faces_layout.addWidget(placeholder, 0, 0, Qt.AlignCenter)
                 return
 
-        # Si es append y no hay nada nuevo, salimos
         if append and not face_list:
             return
 
-        # Limpiar placeholder de "No se han encontrado" si existe
         if self.unknown_faces_layout.count() == 1:
             item = self.unknown_faces_layout.itemAt(0)
             widget = item.widget()
@@ -4455,20 +4544,23 @@ class VisageVaultApp(QMainWindow):
                  widget.deleteLater()
                  self.current_face_count = 0
 
-        # Recalcular columnas disponibles
+        # --- CORRECCIÓN DE GEOMETRÍA DE PRECARGA ---
+        # Obtenemos el ancho real del área de scroll
         viewport_width = self.left_people_stack.width() - 30
-        num_cols = max(1, viewport_width // 110)
 
-        # --- MEJORA: Usar el conteo real del layout para no pisar items ---
-        # Esto asegura que si borraste una cara, la nueva no intente ocupar su hueco antiguo erróneamente
+        # Si la pestaña está oculta (precarga), el ancho suele ser irrelevante (ej: 100px).
+        # En ese caso, usamos el ancho de la ventana principal menos el panel lateral (aprox 280px)
+        if viewport_width < 300:
+            viewport_width = max(400, self.width() - 350)
+        # -------------------------------------------
+
+        num_cols = max(1, viewport_width // 110)
         start_index = self.unknown_faces_layout.count()
 
         for i, face_row in enumerate(face_list):
             face_id = face_row['id']
 
-            # Crear el widget de la cara
             face_widget = CircularFaceLabel(QPixmap())
-            # Usamos un texto más claro o vacío mientras carga
             face_widget.setText("Cargando...")
             face_widget.setStyleSheet("color: gray; font-size: 10px;")
 
@@ -4477,14 +4569,12 @@ class VisageVaultApp(QMainWindow):
             face_widget.rightClicked.connect(self._on_face_right_clicked)
             face_widget.clicked.connect(self._on_face_clicked)
 
-            # Calcular posición exacta (Flow Layout simulado)
             current_idx = start_index + i
             row = current_idx // num_cols
             col = current_idx % num_cols
 
             self.unknown_faces_layout.addWidget(face_widget, row, col, Qt.AlignTop)
 
-            # Lanzar carga de imagen en segundo plano
             loader = FaceLoader(
                 self.face_loader_signals,
                 face_id,
@@ -4493,7 +4583,6 @@ class VisageVaultApp(QMainWindow):
             )
             self.threadpool.start(loader)
 
-        # Actualizamos el contador global
         self.current_face_count = start_index + len(face_list)
 
     def _load_existing_faces_async(self):
@@ -4631,17 +4720,40 @@ class VisageVaultApp(QMainWindow):
     @Slot(int, str, str)
     def _handle_face_found(self, face_id: int, photo_path: str, location_str: str):
         """
-        Se llama cada vez que el escáner encuentra una cara nueva en segundo plano.
+        Se llama cada vez que el escáner encuentra una cara nueva.
+        CORRECCIÓN: Usa fallback de ancho si la pestaña está oculta.
         """
-        # --- OPTIMIZACIÓN CRÍTICA ---
-        # Si NO estamos en la pestaña 'Personas', no cargamos la miniatura visual.
-        # La cara ya está guardada en la BD, así que se cargará cuando el usuario cambie de pestaña.
-        # Esto evita que se sature el procesador mientras navegas por fotos/vídeos.
         if self.tab_widget.currentWidget() != self.personas_tab_widget:
+            # Si no estamos viendo la pestaña, no añadimos widget para ahorrar CPU.
+            # Se añadirá solo cuando entremos a la pestaña (gracias a _load_existing_faces_async).
             return
-        # ----------------------------
 
-        # Si estamos en la pestaña Personas, cargamos la miniatura inmediatamente
+        face_widget = CircularFaceLabel(QPixmap())
+        face_widget.setText("...")
+        face_widget.setStyleSheet("background-color: #333333; border-radius: 50px; color: white;")
+
+        face_widget.setProperty("face_id", face_id)
+        face_widget.setProperty("photo_path", photo_path)
+        face_widget.setProperty("is_deleted_view", False)
+
+        face_widget.clicked.connect(self._on_face_clicked)
+        face_widget.rightClicked.connect(self._on_face_right_clicked)
+
+        # --- CORRECCIÓN DE GEOMETRÍA ---
+        viewport_width = self.face_scroll_area.viewport().width() - 30
+        if viewport_width < 300:
+             viewport_width = max(400, self.width() - 350)
+        # ------------------------------
+
+        num_cols = max(1, viewport_width // 110)
+
+        row = self.current_face_count // num_cols
+        col = self.current_face_count % num_cols
+
+        self.unknown_faces_layout.addWidget(face_widget, row, col, Qt.AlignTop)
+
+        self.current_face_count += 1
+
         loader = FaceLoader(
             self.face_loader_signals,
             face_id,
@@ -4722,55 +4834,48 @@ class VisageVaultApp(QMainWindow):
     def closeEvent(self, event):
         """Limpia de forma segura todos los hilos antes de salir."""
         print("Cerrando aplicación... Por favor, espere.")
-        self._set_status("Cerrando... esperando a que terminen las tareas de fondo.")
+        self._set_status("Cerrando... limpiando recursos.")
 
         try:
             self._save_photo_splitter_state()
             self._save_video_splitter_state()
-            # También guardamos el tamaño de la miniatura por seguridad
             config_manager.set_thumbnail_size(self.current_thumbnail_size)
-        except Exception as e:
-            print(f"Error al guardar configuración al cerrar: {e}")
+        except Exception: pass
 
         if self.file_watcher:
             self.file_watcher.stop()
 
-        # 1. Detener el hilo de escaneo de fotos
-        if self.photo_thread and self.photo_thread.isRunning():
-            print("Deteniendo el hilo de escaneo de fotos...")
-            if self.photo_worker:
-                self.photo_worker.is_running = False
-                try: self.photo_worker.finished.disconnect()
-                except RuntimeError: pass
-            self.photo_thread.quit()
-            self.photo_thread.wait(3000)
+        # 1. PARADA AGRESIVA DEL THREADPOOL GLOBAL (Miniaturas)
+        self.threadpool.clear() # Borra tareas pendientes
+        # No esperamos (waitForDone) si queremos salir rápido, o esperamos poco
 
-        # 2. Detener el hilo de escaneo de vídeos (NUEVO)
-        if self.video_thread and self.video_thread.isRunning():
-            print("Deteniendo el hilo de escaneo de vídeos...")
-            if self.video_worker:
-                self.video_worker.is_running = False
-                try: self.video_worker.finished.disconnect()
-                except RuntimeError: pass
-            self.video_thread.quit()
-            self.video_thread.wait(3000)
+        # 2. Detener workers de ESCANEO (Fotos/Videos)
+        for thread, worker_name in [(self.photo_thread, 'photo_worker'), (self.video_thread, 'video_worker')]:
+            if thread and thread.isRunning():
+                worker = getattr(self, worker_name, None)
+                if worker:
+                    worker.is_running = False
+                thread.quit()
+                thread.wait(500) # Espera corta
 
-        # 3. Detener el hilo de escaneo de caras
+        # 3. DETENER HILO DE CARAS (EL PROBLEMÁTICO)
         if self.face_scan_thread and self.face_scan_thread.isRunning():
-            print("Deteniendo el hilo de escaneo de caras...")
+            print("Deteniendo escáner de caras...")
             if self.face_scan_worker:
-                self.face_scan_worker.is_running = False
+                # LLAMADA AL NUEVO MÉTODO DE APAGADO FORZOSO
+                self.face_scan_worker.stop()
+
+                # Desconectar señales para evitar intentos de escritura en UI muerta
                 try: self.face_scan_worker.signals.scan_finished.disconnect()
-                except RuntimeError: pass
+                except: pass
+
             self.face_scan_thread.quit()
-            self.face_scan_thread.wait(3000)
+            # Esperamos un poco más para dejar que el ThreadPoolExecutor se limpie
+            if not self.face_scan_thread.wait(2000):
+                print("Forzando terminación del hilo de caras...")
+                self.face_scan_thread.terminate() # Último recurso si se cuelga
 
-        # 4. Esperar al pool de QRunnables
-        print("Esperando tareas del ThreadPool (miniaturas/caras)...")
-        self.threadpool.clear()
-        self.threadpool.waitForDone(3000)
-
-        print("Todos los hilos finalizados. Saliendo.")
+        print("Limpieza finalizada. Adiós.")
         event.accept()
 
     # --- ¡NUEVO MÉTODO DE KEYPRESS! ---
@@ -5476,35 +5581,29 @@ class VisageVaultApp(QMainWindow):
                 widgets_to_add_for_year.append(month_label)
                 self.cloud_group_widgets[f"{year}-{month}"] = month_label
 
-                # --- LISTA DE FOTOS (Configuración IDÉNTICA a _display_photos) ---
+                # --- LISTA DE FOTOS ---
                 list_widget = PreviewListWidget()
                 list_widget.setMovement(QListWidget.Static)
                 list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-                list_widget.setSpacing(20) # Mismo espaciado que Fotos
+                list_widget.setSpacing(20)
 
-                # ===============================================================
-                # ### --- AÑADIDO: MENÚ CONTEXTUAL PARA DRIVE ---
-                # ===============================================================
+                # Menú contextual
                 list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
                 list_widget.customContextMenuRequested.connect(
                     lambda pos, lw=list_widget: self._on_drive_context_menu(pos, lw)
                 )
-                # ===============================================================
 
-                # Configuración visual: SIN CSS MANUAL para usar el tema del sistema
                 list_widget.setViewMode(QListWidget.IconMode)
-                list_widget.setResizeMode(QListWidget.Adjust) # Adjust permite redimensionar celdas
+                list_widget.setResizeMode(QListWidget.Adjust)
                 list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setFrameShape(QFrame.NoFrame)
 
                 list_widget.previewRequested.connect(self._on_drive_preview_requested)
 
-                # Usamos 128px de base
-                icon_size = 128
+                # Usamos el tamaño configurado por el usuario
+                icon_size = self.current_thumbnail_size
                 list_widget.setIconSize(QSize(icon_size, icon_size))
-
-                # Tamaño inicial cuadrado (mientras carga)
                 item_dim = icon_size + 8
 
                 for f in photos:
@@ -5521,13 +5620,10 @@ class VisageVaultApp(QMainWindow):
                     item.setData(Qt.UserRole, safe_data)
                     item.setData(Qt.UserRole + 1, "not_loaded")
                     item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
-
-                    # Tamaño inicial (se ajustará luego en _update_thumbnail)
                     item.setSizeHint(QSize(item_dim, item_dim))
-
                     list_widget.addItem(item)
 
-                # Cálculo de altura para el ScrollArea
+                # Cálculo de altura
                 viewport_width = self.cloud_scroll_area.viewport().width() - 30
                 thumb_total_width = item_dim + list_widget.spacing()
                 num_cols = max(1, viewport_width // thumb_total_width)
@@ -5543,7 +5639,18 @@ class VisageVaultApp(QMainWindow):
             year_item.setExpanded(True)
 
         self.cloud_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
+
+        # --- CORRECCIÓN AQUÍ: Forzar actualización visual ---
+
+        # 1. Forzar al layout a calcular posiciones YA
+        if self.cloud_scroll_area.widget():
+            self.cloud_scroll_area.widget().adjustSize()
+
+        # 2. Llamada en DOS TIEMPOS para asegurar que Qt ha pintado los widgets
+        # Intento inmediato (50ms)
+        QTimer.singleShot(50, self._load_visible_cloud_thumbnails)
+        # Intento de seguridad (300ms) por si el layout tardó en pintarse
+        QTimer.singleShot(300, self._load_visible_cloud_thumbnails)
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_cloud_item(self, current, previous):
@@ -5568,38 +5675,54 @@ class VisageVaultApp(QMainWindow):
                 pass
 
     def _load_visible_cloud_thumbnails(self):
-        """Carga SOLO las miniaturas que se ven en pantalla (Nube)."""
+        """
+        Carga miniaturas visibles con PRIORIDAD ALTA y pre-carga las siguientes con PRIORIDAD BAJA.
+        """
         viewport = self.cloud_scroll_area.viewport()
-        preload_rect = viewport.rect().adjusted(0, -500, 0, 500) # Precarga 500px arriba/abajo
+
+        # 1. Área visible inmediata (Prioridad 10)
+        visible_rect = viewport.rect()
+
+        # 2. Área de pre-carga: 2 pantallas más abajo (Prioridad 0)
+        prefetch_rect = viewport.rect().adjusted(0, 0, 0, viewport.height() * 2)
 
         widget_contenedor = self.cloud_scroll_area.widget()
         if not widget_contenedor: return
 
-        # Buscar todas las listas dentro del área de nube
         for list_widget in widget_contenedor.findChildren(PreviewListWidget):
-
-            # Si la lista no está visible, saltarla
             if not list_widget.isVisible(): continue
 
-            # Coordenadas relativas al viewport
+            # Mapear coordenadas de la lista al viewport
             pos = list_widget.mapTo(viewport, list_widget.rect().topLeft())
             rect = list_widget.rect().translated(pos)
 
-            # Si la lista cruza el área visible (+ margen)
-            if preload_rect.intersects(rect):
-                for i in range(list_widget.count()):
-                    item = list_widget.item(i)
-                    # Si no está cargada ni cargando...
-                    if item.data(Qt.UserRole + 1) == "not_loaded":
-                        data = item.data(Qt.UserRole)
-                        thumb_link = data.get('thumbnailLink')
-                        file_id = data.get('id')
+            # Si la lista no está ni en visible ni en prefetch, la ignoramos para ahorrar CPU
+            if not (visible_rect.intersects(rect) or prefetch_rect.intersects(rect)):
+                continue
 
-                        if thumb_link and file_id:
-                            item.setData(Qt.UserRole + 1, "loading")
-                            # Usamos el NetworkThumbnailLoader
-                            worker = NetworkThumbnailLoader(thumb_link, file_id, self.thumb_signals)
-                            self.threadpool.start(worker)
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+
+                if item.data(Qt.UserRole + 1) == "not_loaded":
+                    # Calcular posición aproximada del item
+                    # (No es exacto píxel a píxel por rendimiento, pero sirve para priorizar)
+
+                    priority = 0 # Baja por defecto (Prefetch)
+
+                    # Si la lista intersecta el área visible, asumimos prioridad alta
+                    # para asegurar que se carguen rápido.
+                    if visible_rect.intersects(rect):
+                        priority = 10
+
+                    data = item.data(Qt.UserRole)
+                    thumb_link = data.get('thumbnailLink')
+                    file_id = data.get('id')
+
+                    if thumb_link and file_id:
+                        item.setData(Qt.UserRole + 1, "loading")
+                        worker = NetworkThumbnailLoader(thumb_link, file_id, self.thumb_signals)
+                        # Lanzar con PRIORIDAD
+                        self.threadpool.start(worker, priority)
 
     def _stop_cloud_operations(self):
         """Detiene de forma SEGURA cualquier descarga o escaneo."""

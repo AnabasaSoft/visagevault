@@ -1,42 +1,231 @@
 # ==============================================================================
-# ARCHIVO: db_manager.py
-# DESCRIPCIÓN: Gestor de base de datos SQLite para VisageVault
-# INCLUYE: Migraciones automáticas, soporte para Ocultar/Borrar y optimización.
+# ARCHIVO: db_manager.py (SISTEMA INTELIGENTE DE RECUPERACIÓN)
 # ==============================================================================
 
 import sqlite3
 import os
 import pickle
+import shutil
 import datetime
+from pathlib import Path
 
 class VisageVaultDB:
     def __init__(self, db_name="visagevault.db", is_worker=False):
         """
-        Inicializa la conexión a la base de datos.
-        Si is_worker=True, evita crear tablas/migraciones para prevenir conflictos en hilos.
+        Inicializa la conexión.
+        Si es el hilo principal (is_worker=False), realiza chequeos de integridad
+        y gestión de la base de datos de metadatos (MetaDB).
         """
-        # Guardar la BD en el mismo directorio que el script
+        self.was_reset = False # Bandera para avisar a la UI
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.db_path = os.path.join(base_dir, db_name)
+        self.meta_db_path = os.path.join(base_dir, "visagevault_meta.db")
 
-        # check_same_thread=False es necesario para aplicaciones GUI con hilos (QThread)
+        # 1. Inicializar siempre la MetaDB (Respaldo de datos valiosos)
+        self._init_meta_db()
+
+        # 2. Intentar conectar a la BD Principal
+        try:
+            self._connect_main_db()
+
+            if not is_worker:
+                # CHEQUEO DE SALUD
+                if not self._check_integrity():
+                    raise sqlite3.DatabaseError("La base de datos está corrupta o es incompatible.")
+
+                # Si llegamos aquí, la BD está sana.
+                # Hacemos backup de los datos actuales a la MetaDB por seguridad
+                self._sync_main_to_meta()
+
+                self._create_tables()
+                self._check_migrations()
+
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+            if is_worker:
+                # Un worker no debe intentar arreglar la BD, solo fallar
+                print(f"Worker falló al conectar DB: {e}")
+                raise e
+
+            print(f"❌ ERROR CRÍTICO EN BD: {e}")
+            print("🔄 Iniciando protocolo de AUTOREPARACIÓN...")
+            self._perform_hard_reset()
+
+    def _connect_main_db(self):
+        """Conexión estándar con optimizaciones."""
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row  # Permite acceder a columnas por nombre
+        self.conn.row_factory = sqlite3.Row
 
-        # --- OPTIMIZACIÓN CLAVE: WAL MODE ---
-        # Permite lecturas y escrituras concurrentes sin bloqueo total
+        # Optimizaciones
         self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;") # Un poco menos seguro ante cortes de luz, pero mucho más rápido
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA cache_size = -64000;")
+        self.conn.execute("PRAGMA temp_store = MEMORY;")
 
-        # Solo el hilo principal debe gestionar la estructura de la BD
-        if not is_worker:
-            self._create_tables()
-            self._check_migrations()
+    # =========================================================================
+    # GESTIÓN DE META-DB (La caja fuerte de tus fechas)
+    # =========================================================================
+
+    def _init_meta_db(self):
+        """Prepara la base de datos paralela de metadatos."""
+        try:
+            self.meta_conn = sqlite3.connect(self.meta_db_path, check_same_thread=False)
+            with self.meta_conn:
+                self.meta_conn.execute("""
+                    CREATE TABLE IF NOT EXISTS file_metadata (
+                        filepath TEXT PRIMARY KEY,
+                        year TEXT,
+                        month TEXT,
+                        is_hidden INTEGER DEFAULT 0,
+                        last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+        except Exception as e:
+            print(f"Error iniciando MetaDB: {e}")
+
+    def _save_meta(self, filepath, year=None, month=None, is_hidden=None):
+        """Guarda o actualiza un registro en la MetaDB."""
+        try:
+            # Primero miramos si ya existe para no sobrescribir datos con None
+            cursor = self.meta_conn.execute("SELECT * FROM file_metadata WHERE filepath = ?", (filepath,))
+            row = cursor.fetchone()
+
+            current_year = row[1] if row else None
+            current_month = row[2] if row else None
+            current_hidden = row[3] if row else 0
+
+            # Aplicar nuevos valores si se proporcionan
+            new_year = year if year is not None else current_year
+            new_month = month if month is not None else current_month
+            new_hidden = is_hidden if is_hidden is not None else current_hidden
+
+            with self.meta_conn:
+                self.meta_conn.execute("""
+                    INSERT OR REPLACE INTO file_metadata (filepath, year, month, is_hidden)
+                    VALUES (?, ?, ?, ?)
+                """, (filepath, new_year, new_month, new_hidden))
+        except Exception as e:
+            print(f"Warning: No se pudo guardar en MetaDB: {e}")
+
+    def _sync_main_to_meta(self):
+        """Copia datos existentes de la BD principal a la MetaDB (Backup inicial)."""
+        try:
+            # Solo lo hacemos si la MetaDB está vacía o para asegurar consistencia
+            cursor = self.meta_conn.execute("SELECT COUNT(*) FROM file_metadata")
+            count = cursor.fetchone()[0]
+            if count > 0:
+                return # Ya tenemos backup, no sobrescribimos masivamente
+
+            print("⚙️ Creando respaldo de fechas en MetaDB...")
+
+            # Copiar Fotos
+            photos = self.conn.execute("SELECT filepath, year, month, is_hidden FROM photos").fetchall()
+            data = [(p['filepath'], p['year'], p['month'], p['is_hidden']) for p in photos]
+
+            # Copiar Vídeos
+            videos = self.conn.execute("SELECT filepath, year, month, is_hidden FROM videos").fetchall()
+            data.extend([(v['filepath'], v['year'], v['month'], v['is_hidden']) for v in videos])
+
+            with self.meta_conn:
+                self.meta_conn.executemany("""
+                    INSERT OR IGNORE INTO file_metadata (filepath, year, month, is_hidden)
+                    VALUES (?, ?, ?, ?)
+                """, data)
+            print("✅ Respaldo completado.")
+        except Exception as e:
+            print(f"Error en backup a MetaDB: {e}")
+
+    # =========================================================================
+    # PROTOCOLO DE AUTOREPARACIÓN
+    # =========================================================================
+
+    def _check_integrity(self):
+        """Verifica si la BD es utilizable."""
+        try:
+            # 1. Check de integridad de SQLite
+            cursor = self.conn.execute("PRAGMA integrity_check;")
+            result = cursor.fetchone()
+            if result[0] != "ok":
+                return False
+
+            # 2. Check básico de tablas esenciales
+            self.conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='photos'")
+
+            return True
+        except:
+            return False
+
+    def _perform_hard_reset(self):
+        """
+        EL BOTÓN DE PÁNICO:
+        1. Cierra conexión.
+        2. Renombra la BD corrupta.
+        3. Crea una nueva.
+        4. Restaura las fechas desde MetaDB.
+        """
+        try:
+            self.conn.close()
+        except: pass
+
+        # Renombrar corrupta
+        if os.path.exists(self.db_path):
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            corrupt_path = f"{self.db_path}.corrupt_{timestamp}"
+            try:
+                os.rename(self.db_path, corrupt_path)
+                print(f"⚠️ Base de datos corrupta movida a: {corrupt_path}")
+            except OSError:
+                print("No se pudo mover la BD, intentando borrar...")
+                os.remove(self.db_path)
+
+        # Re-conectar (crea archivo nuevo)
+        self._connect_main_db()
+        self._create_tables() # Estructura limpia
+
+        # RESTAURACIÓN DE DATOS VALIOSOS
+        print("♻️ Restaurando fechas personalizadas desde MetaDB...")
+        try:
+            rows = self.meta_conn.execute("SELECT filepath, year, month, is_hidden FROM file_metadata").fetchall()
+
+            # Insertamos 'stubs' (esqueletos) en las tablas de fotos/videos
+            # El escáner rellenará el resto, pero las fechas ya estarán ahí.
+            photos_to_restore = []
+            videos_to_restore = []
+
+            # Clasificación simple por extensión
+            VIDEO_EXTS = ('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg')
+
+            for r in rows:
+                path = r[0]
+                ext = os.path.splitext(path)[1].lower()
+                if ext in VIDEO_EXTS:
+                    videos_to_restore.append(r)
+                else:
+                    photos_to_restore.append(r)
+
+            with self.conn:
+                self.conn.executemany("""
+                    INSERT OR REPLACE INTO photos (filepath, year, month, is_hidden, scanned_for_faces)
+                    VALUES (?, ?, ?, ?, 0)
+                """, [(r[0], r[1], r[2], r[3]) for r in photos_to_restore])
+
+                self.conn.executemany("""
+                    INSERT OR REPLACE INTO videos (filepath, year, month, is_hidden)
+                    VALUES (?, ?, ?, ?)
+                """, [(r[0], r[1], r[2], r[3]) for r in videos_to_restore])
+
+            print("✅ Restauración completada.")
+            self.was_reset = True # Avisar a la UI
+
+        except Exception as e:
+            print(f"Error restaurando datos: {e}")
+
+    # =========================================================================
+    # TABLAS Y MIGRACIONES (Estándar)
+    # =========================================================================
 
     def _create_tables(self):
-        """Crea la estructura inicial de tablas si no existe."""
         with self.conn:
-            # 1. Tabla de FOTOS
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS photos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,8 +236,6 @@ class VisageVaultDB:
                     is_hidden INTEGER DEFAULT 0
                 )
             """)
-
-            # 2. Tabla de VÍDEOS
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,16 +245,12 @@ class VisageVaultDB:
                     is_hidden INTEGER DEFAULT 0
                 )
             """)
-
-            # 3. Tabla de PERSONAS
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS people (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE
                 )
             """)
-
-            # 4. Tabla de CARAS (Relacionada con Fotos y Personas)
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS faces (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,8 +263,6 @@ class VisageVaultDB:
                     FOREIGN KEY(person_id) REFERENCES people(id)
                 )
             """)
-
-            # 5. Tabla de GOOGLE DRIVE
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS drive_photos (
                     id TEXT PRIMARY KEY,
@@ -90,71 +271,105 @@ class VisageVaultDB:
                     mime_type TEXT,
                     thumbnail_link TEXT,
                     web_content_link TEXT,
-                    parent_id TEXT
+                    parent_id TEXT,
+                    root_folder_id TEXT
                 )
             """)
-
-            # 6. Tabla de CAJA FUERTE
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS safe_files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    original_path TEXT,     -- Ruta original para restaurar
-                    encrypted_path TEXT,    -- Dónde está ahora (visagevault_safe/...)
-                    media_type TEXT,        -- 'photo' o 'video'
-                    original_date TEXT      -- Para re-ordenar al restaurar
+                    original_path TEXT,
+                    encrypted_path TEXT,
+                    media_type TEXT,
+                    original_date TEXT
                 )
             """)
 
+            # Índices
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_hidden ON photos(is_hidden)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_year_month ON photos(year, month)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_scanned ON photos(scanned_for_faces)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(is_hidden)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_year_month ON videos(year, month)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_drive_parent ON drive_photos(parent_id)")
+
     def _check_migrations(self):
-        """
-        Verifica si la base de datos existente necesita actualizaciones de estructura
-        (por ejemplo, si el usuario viene de una versión anterior).
-        """
         try:
             with self.conn:
-                # --- Migración FOTOS (Añadir is_hidden) ---
+                # Migración FOTOS
                 cursor = self.conn.execute("PRAGMA table_info(photos)")
-                columns_photos = [col['name'] for col in cursor.fetchall()]
-
-                if 'is_hidden' not in columns_photos:
-                    print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a photos.")
+                cols = [col['name'] for col in cursor.fetchall()]
+                if 'is_hidden' not in cols:
                     self.conn.execute("ALTER TABLE photos ADD COLUMN is_hidden INTEGER DEFAULT 0")
 
-                # --- Migración VÍDEOS (Añadir is_hidden) ---
+                # Migración VÍDEOS
                 cursor = self.conn.execute("PRAGMA table_info(videos)")
-                columns_videos = [col['name'] for col in cursor.fetchall()]
-
-                if 'is_hidden' not in columns_videos:
-                    print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a videos.")
+                cols = [col['name'] for col in cursor.fetchall()]
+                if 'is_hidden' not in cols:
                     self.conn.execute("ALTER TABLE videos ADD COLUMN is_hidden INTEGER DEFAULT 0")
 
-                # --- Migración DRIVE (Añadir root_folder_id) ---
-                # Primero verificamos si la tabla drive_photos existe (puede que sea una instalación nueva)
+                # Migración DRIVE
                 cursor = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='drive_photos'")
                 if cursor.fetchone():
                     cursor = self.conn.execute("PRAGMA table_info(drive_photos)")
-                    columns_drive = [col['name'] for col in cursor.fetchall()]
-
-                    if 'root_folder_id' not in columns_drive:
-                        print("INFO: Migrando BD Drive... Añadiendo columna 'root_folder_id' a drive_photos.")
+                    cols = [col['name'] for col in cursor.fetchall()]
+                    if 'root_folder_id' not in cols:
                         self.conn.execute("ALTER TABLE drive_photos ADD COLUMN root_folder_id TEXT")
-
         except Exception as e:
-            print(f"ERROR en migraciones de BD: {e}")
+            print(f"Advertencia migración: {e}")
 
     # =========================================================================
-    # GESTIÓN DE FOTOS
+    # MÉTODOS DE LECTURA/ESCRITURA (Actualizados con MetaDB)
     # =========================================================================
+
+    def update_photo_date(self, filepath, year, month):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
+        # RESPALDO
+        self._save_meta(filepath, year=year, month=month)
+
+    def update_video_date(self, filepath, year, month):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
+        # RESPALDO
+        self._save_meta(filepath, year=year, month=month)
+
+    def hide_photo(self, photo_path):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET is_hidden = 1 WHERE filepath = ?", (photo_path,))
+        # RESPALDO
+        self._save_meta(photo_path, is_hidden=1)
+
+    def unhide_photo(self, photo_path):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET is_hidden = 0 WHERE filepath = ?", (photo_path,))
+        # RESPALDO
+        self._save_meta(photo_path, is_hidden=0)
+
+    def hide_video(self, video_path):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET is_hidden = 1 WHERE filepath = ?", (video_path,))
+        # RESPALDO
+        self._save_meta(video_path, is_hidden=1)
+
+    def unhide_video(self, video_path):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET is_hidden = 0 WHERE filepath = ?", (video_path,))
+        # RESPALDO
+        self._save_meta(video_path, is_hidden=0)
+
+    # --- EL RESTO DE MÉTODOS SE MANTIENEN IGUAL ---
+    # (Copia aquí get_photo_date, load_all_photo_dates, bulk_upsert, faces, drive, safe, etc.)
+    # Solo asegúrate de que los métodos de modificación (update/hide) tengan la llamada a _save_meta
 
     def load_all_photo_dates(self):
-        """Carga todas las fechas de fotos para el escaneo inicial."""
-        # Solo cargamos las que NO están ocultas para el mapa visual normal,
-        # o cargamos todas y filtramos luego. Para sincronizar es mejor cargar todo.
         cursor = self.conn.execute("SELECT filepath, year, month FROM photos")
         return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
 
     def bulk_upsert_photos(self, photos_list):
-        """Inserta o actualiza muchas fotos de golpe (optimización)."""
+        # NOTA: En cargas masivas iniciales NO escribimos en MetaDB uno a uno por rendimiento.
+        # Solo actualizamos MetaDB cuando el usuario cambia algo manualmente.
         with self.conn:
             self.conn.executemany("""
                 INSERT INTO photos (filepath, year, month)
@@ -165,56 +380,33 @@ class VisageVaultDB:
             """, photos_list)
 
     def bulk_delete_photos(self, paths_list):
-        """Elimina fotos que ya no existen en disco de la BD."""
-        if not paths_list:
-            return
+        if not paths_list: return
         with self.conn:
-            # Convertir lista a lista de tuplas para executemany
             tuples = [(p,) for p in paths_list]
             self.conn.executemany("DELETE FROM photos WHERE filepath = ?", tuples)
 
     def get_photo_date(self, filepath):
         cursor = self.conn.execute("SELECT year, month FROM photos WHERE filepath = ?", (filepath,))
         row = cursor.fetchone()
-        if row:
-            return row['year'], row['month']
+        if row: return row['year'], row['month']
         return None, None
 
-    def update_photo_date(self, filepath, year, month):
-        with self.conn:
-            self.conn.execute("UPDATE photos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
-
-    # --- Funciones de Ocultar/Borrar Fotos ---
-
-    def hide_photo(self, photo_path):
-        with self.conn:
-            self.conn.execute("UPDATE photos SET is_hidden = 1 WHERE filepath = ?", (photo_path,))
-
-    def unhide_photo(self, photo_path):
-        with self.conn:
-            self.conn.execute("UPDATE photos SET is_hidden = 0 WHERE filepath = ?", (photo_path,))
-
     def get_hidden_photos(self):
-        """Devuelve lista de rutas de fotos ocultas."""
         cursor = self.conn.execute("SELECT filepath FROM photos WHERE is_hidden = 1")
         return [row['filepath'] for row in cursor.fetchall()]
 
     def delete_photo_permanently(self, photo_path):
-        """Borra la foto de la BD y sus caras asociadas."""
         with self.conn:
-            # 1. Obtener ID para borrar caras
             cur = self.conn.execute("SELECT id FROM photos WHERE filepath = ?", (photo_path,))
             row = cur.fetchone()
             if row:
-                photo_id = row['id']
-                self.conn.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
-
-            # 2. Borrar la entrada de la foto
+                self.conn.execute("DELETE FROM faces WHERE photo_id = ?", (row['id'],))
             self.conn.execute("DELETE FROM photos WHERE filepath = ?", (photo_path,))
-
-    # =========================================================================
-    # GESTIÓN DE VÍDEOS
-    # =========================================================================
+        # Opcional: Borrar también de MetaDB si se borra permanentemente del disco
+        try:
+            with self.meta_conn:
+                self.meta_conn.execute("DELETE FROM file_metadata WHERE filepath = ?", (photo_path,))
+        except: pass
 
     def load_all_video_dates(self):
         cursor = self.conn.execute("SELECT filepath, year, month FROM videos")
@@ -223,8 +415,7 @@ class VisageVaultDB:
     def get_video_date(self, filepath):
         cursor = self.conn.execute("SELECT year, month FROM videos WHERE filepath = ?", (filepath,))
         row = cursor.fetchone()
-        if row:
-            return row['year'], row['month']
+        if row: return row['year'], row['month']
         return None, None
 
     def bulk_upsert_videos(self, videos_list):
@@ -238,21 +429,10 @@ class VisageVaultDB:
             """, videos_list)
 
     def bulk_delete_videos(self, paths_list):
-        if not paths_list:
-            return
+        if not paths_list: return
         with self.conn:
             tuples = [(p,) for p in paths_list]
             self.conn.executemany("DELETE FROM videos WHERE filepath = ?", tuples)
-
-    # --- Funciones de Ocultar/Borrar Vídeos ---
-
-    def hide_video(self, video_path):
-        with self.conn:
-            self.conn.execute("UPDATE videos SET is_hidden = 1 WHERE filepath = ?", (video_path,))
-
-    def unhide_video(self, video_path):
-        with self.conn:
-            self.conn.execute("UPDATE videos SET is_hidden = 0 WHERE filepath = ?", (video_path,))
 
     def get_hidden_videos(self):
         cursor = self.conn.execute("SELECT filepath FROM videos WHERE is_hidden = 1")
@@ -261,17 +441,12 @@ class VisageVaultDB:
     def delete_video_permanently(self, video_path):
         with self.conn:
             self.conn.execute("DELETE FROM videos WHERE filepath = ?", (video_path,))
-
-    def update_video_date(self, filepath, year, month):
-        with self.conn:
-            self.conn.execute("UPDATE videos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
-
-    # =========================================================================
-    # GESTIÓN DE CARAS (Reconocimiento Facial)
-    # =========================================================================
+        try:
+            with self.meta_conn:
+                self.meta_conn.execute("DELETE FROM file_metadata WHERE filepath = ?", (video_path,))
+        except: pass
 
     def get_unscanned_photos(self):
-        """Devuelve fotos que aún no han sido escaneadas en busca de caras y no están ocultas."""
         cursor = self.conn.execute("""
             SELECT id, filepath FROM photos
             WHERE scanned_for_faces = 0 AND is_hidden = 0
@@ -291,7 +466,6 @@ class VisageVaultDB:
             return cursor.lastrowid
 
     def get_unknown_faces(self):
-        """Obtiene caras no asignadas a ninguna persona y no eliminadas."""
         cursor = self.conn.execute("""
             SELECT f.id, f.location, p.filepath
             FROM faces f
@@ -301,7 +475,6 @@ class VisageVaultDB:
         return cursor.fetchall()
 
     def get_unknown_face_encodings(self):
-        """Obtiene encodings de caras desconocidas para el clustering."""
         cursor = self.conn.execute("""
             SELECT id, encoding FROM faces
             WHERE person_id IS NULL AND is_deleted = 0
@@ -311,12 +484,10 @@ class VisageVaultDB:
             try:
                 encoding = pickle.loads(row['encoding'])
                 data.append((row['id'], encoding))
-            except:
-                pass
+            except: pass
         return data
 
     def get_face_info(self, face_id):
-        """Obtiene ruta y ubicación para recortar la miniatura de la cara."""
         cursor = self.conn.execute("""
             SELECT f.location, p.filepath
             FROM faces f
@@ -324,22 +495,18 @@ class VisageVaultDB:
             WHERE f.id = ?
         """, (face_id,))
         row = cursor.fetchone()
-        if row:
-            return {'location': row['location'], 'filepath': row['filepath']}
+        if row: return {'location': row['location'], 'filepath': row['filepath']}
         return None
 
     def soft_delete_face(self, face_id):
-        """Marca una cara como eliminada (falso positivo)."""
         with self.conn:
             self.conn.execute("UPDATE faces SET is_deleted = 1, person_id = NULL WHERE id = ?", (face_id,))
 
     def restore_face(self, face_id):
-        """Restaura una cara eliminada."""
         with self.conn:
             self.conn.execute("UPDATE faces SET is_deleted = 0 WHERE id = ?", (face_id,))
 
     def get_deleted_faces(self):
-        """Devuelve caras marcadas como eliminadas (papelera de caras)."""
         cursor = self.conn.execute("""
             SELECT f.id, f.location, p.filepath
             FROM faces f
@@ -348,17 +515,13 @@ class VisageVaultDB:
         """)
         return cursor.fetchall()
 
-    # =========================================================================
-    # GESTIÓN DE PERSONAS
-    # =========================================================================
-
     def add_person(self, name):
         try:
             with self.conn:
                 cursor = self.conn.execute("INSERT INTO people (name) VALUES (?)", (name,))
                 return cursor.lastrowid
         except sqlite3.IntegrityError:
-            return -1 # Ya existe
+            return -1
 
     def get_all_people(self):
         cursor = self.conn.execute("SELECT id, name FROM people ORDER BY name ASC")
@@ -367,8 +530,7 @@ class VisageVaultDB:
     def get_person_by_name(self, name):
         cursor = self.conn.execute("SELECT id, name FROM people WHERE name = ?", (name,))
         row = cursor.fetchone()
-        if row:
-            return {'id': row['id'], 'name': row['name']}
+        if row: return {'id': row['id'], 'name': row['name']}
         return None
 
     def link_face_to_person(self, face_id, person_id):
@@ -376,7 +538,6 @@ class VisageVaultDB:
             self.conn.execute("UPDATE faces SET person_id = ? WHERE id = ?", (person_id, face_id))
 
     def get_faces_for_person(self, person_id):
-        """Obtiene todas las fotos donde aparece esta persona."""
         cursor = self.conn.execute("""
             SELECT p.filepath, p.year, p.month, f.location
             FROM faces f
@@ -387,66 +548,39 @@ class VisageVaultDB:
         return cursor.fetchall()
 
     def get_all_drive_photos(self, root_folder_id=None):
-        """Recupera fotos de Drive, opcionalmente filtradas por carpeta raíz."""
         if root_folder_id:
-            # Si nos pasan un ID, filtramos solo las fotos de esa carpeta
             cursor = self.conn.execute("SELECT * FROM drive_photos WHERE root_folder_id = ?", (root_folder_id,))
         else:
-            # Si no (comportamiento antiguo), devolvemos todo
             cursor = self.conn.execute("SELECT * FROM drive_photos")
-
         return [dict(row) for row in cursor.fetchall()]
 
     def bulk_upsert_drive_photos(self, photos_list, root_folder_id=None):
-        """Guarda fotos de Drive vinculadas a una carpeta raíz."""
         if not photos_list: return
-
         data_to_insert = []
         for p in photos_list:
-            # Extraer padre (Drive lo da como lista, cogemos el primero o string vacío)
             parent = p.get('parents', [''])[0] if p.get('parents') else ''
-
             data_to_insert.append((
-                p.get('id'),
-                p.get('name'),
-                p.get('createdTime'),
-                p.get('mimeType'),
-                p.get('thumbnailLink'),
-                p.get('webContentLink'),
-                parent,
-                root_folder_id
+                p.get('id'), p.get('name'), p.get('createdTime'), p.get('mimeType'),
+                p.get('thumbnailLink'), p.get('webContentLink'), parent, root_folder_id
             ))
-
         with self.conn:
             self.conn.executemany("""
                 INSERT INTO drive_photos (id, name, created_time, mime_type, thumbnail_link, web_content_link, parent_id, root_folder_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name,
-                thumbnail_link=excluded.thumbnail_link,
-                root_folder_id=excluded.root_folder_id,
-                parent_id=excluded.parent_id  -- <--- ¡ESTA LÍNEA ES NUEVA Y CRÍTICA!
+                name=excluded.name, thumbnail_link=excluded.thumbnail_link,
+                root_folder_id=excluded.root_folder_id, parent_id=excluded.parent_id
             """, data_to_insert)
 
-
     def clear_drive_data(self):
-        """
-        SEGURIDAD: Elimina todos los registros de fotos de la nube de la base de datos local.
-        """
         with self.conn:
             self.conn.execute("DELETE FROM drive_photos")
-            # Opcional: VACUUM para reducir tamaño del archivo, aunque puede ser lento
-            # self.conn.execute("VACUUM")
 
     def get_drive_photos_by_parent(self, parent_id):
-        # IMPORTANTE: Esta consulta busca fotos cuyo PADRE DIRECTO sea la carpeta clickeada
         cursor = self.conn.execute("SELECT * FROM drive_photos WHERE parent_id = ?", (parent_id,))
         return [dict(row) for row in cursor.fetchall()]
 
     def update_drive_photo_date(self, file_id, new_iso_date):
-        """
-        Actualiza la fecha de una foto de Drive localmente para reorganizarla.
-        """
         with self.conn:
             self.conn.execute("UPDATE drive_photos SET created_time = ? WHERE id = ?", (new_iso_date, file_id))
 
