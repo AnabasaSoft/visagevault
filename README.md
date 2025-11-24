@@ -24,14 +24,6 @@ Esta actualización transforma VisageVault en un gestor híbrido (Local + Nube) 
 * **🖱️ Interacción Unificada:** La selección múltiple, el zoom con `Ctrl`+`Rueda` y la navegación funcionan idéntico en Local y Nube.
 * Añadido buscador de fotografías duplicadas
 * Añadido caja fuerte
-
-
----
-
-## ✨ Novedades de la Versión 1.4
-
-Esta versión se centra en el rendimiento, la comodidad y la edición rápida:
-
 * **🔄 Auto-Refresco (Watchdog):** La aplicación detecta automáticamente si añades, borras 
     o modificas fotos en tu carpeta mientras está abierta y actualiza la galería al instante 
     sin reiniciar.

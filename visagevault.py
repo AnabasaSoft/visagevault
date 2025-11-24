@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.6.5
+# VERSIÓN: 1.6.6
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -62,12 +62,12 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QStyle, QFileDialog,
     QScrollArea, QGridLayout, QLabel, QGroupBox, QSpacerItem, QSizePolicy,
-    QSplitter, QTabWidget, QStackedWidget
+    QSplitter, QTabWidget, QStackedWidget, QSplashScreen
 )
 from PySide6.QtCore import (
     Qt, QSize, QObject, Signal, QThread, Slot, QTimer,
     QRunnable, QThreadPool, QPropertyAnimation, QEasingCurve, QRect, QPoint, QRectF,
-    QPointF, QBuffer, QIODevice, QUrl
+    QPointF, QBuffer, QIODevice, QUrl, QEventLoop, QEvent
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent,
@@ -96,6 +96,40 @@ import pickle
 import shutil
 import hashlib
 from functools import lru_cache
+
+# =================================================================
+# EXTRACTOR DE FECHA POR NOMBRE DE ARCHIVO
+# =================================================================
+def parse_date_from_filename(filepath):
+    """
+    Intenta extraer la fecha (Año, Mes) basándose exclusivamente en el nombre del archivo.
+    Soporta: YYYYMMDD, DD-MM-YYYY, YYYY-MM-DD, DDMMYYYY.
+    """
+    filename = os.path.basename(filepath)
+
+    # 1. Patrón YYYYMMDD (Ej: IMG-20250304-..., VID-20240411..., 20231005.jpg)
+    # Busca 20xx seguido de mes (01-12) y día (01-31)
+    match = re.search(r'(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', filename)
+    if match:
+        return match.group(1), match.group(2) # Retorna (Año, Mes)
+
+    # 2. Patrón DD-MM-YYYY o DD.MM.YYYY o DD_MM_YYYY (Ej: 07-10-2023.jpg)
+    match = re.search(r'(0[1-9]|[12]\d|3[01])[-._](0[1-9]|1[0-2])[-._](20\d{2})', filename)
+    if match:
+        return match.group(3), match.group(2) # Retorna (Año, Mes)
+
+    # 3. Patrón YYYY-MM-DD (Ej: 2023-11-01_Foto.jpg)
+    match = re.search(r'(20\d{2})[-._](0[1-9]|1[0-2])[-._](0[1-9]|[12]\d|3[01])', filename)
+    if match:
+        return match.group(1), match.group(2)
+
+    # 4. Patrón DDMMYYYY Compacto (Ej: IMG-04122021.jpg -> 04/12/2021)
+    # Asume formato europeo DDMMYYYY si no hay separadores
+    match = re.search(r'(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(20\d{2})', filename)
+    if match:
+        return match.group(3), match.group(2)
+
+    return None, None
 
 # --- FUNCIÓN GLOBAL DE CACHÉ EN RAM ---
 # Guarda las últimas 500 imágenes en memoria para que el scroll sea instantáneo
@@ -667,10 +701,12 @@ class FaceLoader(QRunnable):
             pixmap = QPixmap()
 
             # 1. INTENTO DE CARGA RÁPIDA (CACHÉ)
-            # Si el archivo pequeño ya existe, lo cargamos y terminamos. ¡Instantáneo!
             if os.path.exists(self.cache_path):
                 if pixmap.load(self.cache_path):
-                    self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+                    try:
+                        self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+                    except RuntimeError:
+                        pass # Ignorar si la app se cerró mientras cargábamos
                     return
 
             # 2. SI NO EXISTE CACHÉ: PROCESO LENTO (Abrir original y recortar)
@@ -688,7 +724,7 @@ class FaceLoader(QRunnable):
                         rgb_array = raw.postprocess()
                         img = Image.fromarray(rgb_array)
                 except Exception as e:
-                    print(f"Error rawpy en FaceLoader: {e}")
+                    # print(f"Error rawpy en FaceLoader: {e}")
                     raise e
             else:
                 img = Image.open(self.photo_path)
@@ -699,18 +735,15 @@ class FaceLoader(QRunnable):
             # Recortar la cara
             face_image_pil = img.crop((left, top, right, bottom))
 
-            # 3. GUARDAR EN CACHÉ (Para que la próxima vez sea rápido)
+            # 3. GUARDAR EN CACHÉ
             try:
-                # Convertimos a RGB por si acaso (para guardar en JPG)
                 if face_image_pil.mode != "RGB":
                     face_image_pil = face_image_pil.convert("RGB")
-
-                # Guardamos el recorte en la carpeta face_cache
                 face_image_pil.save(self.cache_path, "JPEG", quality=90)
             except Exception as e:
                 print(f"No se pudo guardar caché para cara {self.face_id}: {e}")
 
-            # 4. Convertir a QPixmap para mostrar ahora mismo
+            # 4. Convertir a QPixmap
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.ReadWrite)
             face_image_pil.save(buffer, "PNG")
@@ -720,12 +753,18 @@ class FaceLoader(QRunnable):
             if pixmap.isNull():
                 raise Exception("QPixmap nulo después de la conversión.")
 
-            self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+            # --- PROTECCIÓN CONTRA CIERRE ---
+            try:
+                self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+            except RuntimeError:
+                pass # App cerrada, no hacer nada
 
         except Exception as e:
-            # Si falla, emitimos señal de fallo pero no rompemos el programa
-            # print(f"Error en FaceLoader (ID: {self.face_id}): {e}")
-            self.signals.face_load_failed.emit(self.face_id)
+            # Si falla, emitimos señal de fallo, pero también protegida
+            try:
+                self.signals.face_load_failed.emit(self.face_id)
+            except RuntimeError:
+                pass # App cerrada
 
 # =================================================================
 # SEÑALES Y WORKER PARA AGRUPAR CARAS (CLUSTERING) (Sin cambios)
@@ -787,116 +826,6 @@ class ClusterWorker(QRunnable):
             self.signals.clustering_finished.emit()
 
 # =================================================================
-# CLASE PARA VISTA PREVIA CON ZOOM (QDialog) (Sin cambios)
-# =================================================================
-class ImagePreviewDialog(QDialog):
-    is_showing = False
-    def __init__(self, pixmap: QPixmap, parent=None):
-        super().__init__(parent)
-        ImagePreviewDialog.is_showing = True
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        self._pixmap = pixmap
-        self.label = ZoomableClickableLabel(self)
-        self.label.is_thumbnail_view = False
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.label)
-        self.animation = QPropertyAnimation(self, b"geometry")
-    def show_with_animation(self):
-        screen = QApplication.screenAt(QCursor.pos())
-        if not screen:
-            screen = QApplication.primaryScreen()
-        screen_geom = screen.availableGeometry()
-        img_size = self._pixmap.size()
-        max_width = int(screen_geom.width() * 0.9)
-        max_height = int(screen_geom.height() * 0.9)
-        target_size = img_size
-        if img_size.width() > max_width or img_size.height() > max_height:
-            target_size = img_size.scaled(max_width, max_height, Qt.KeepAspectRatio)
-        self.label.setOriginalPixmap(self._pixmap)
-        self.resize(target_size)
-        center_x = screen_geom.x() + (screen_geom.width() - target_size.width()) // 2
-        center_y = screen_geom.y() + (screen_geom.height() - target_size.height()) // 2
-        self.move(center_x, center_y)
-        self.show()
-    def close_with_animation(self):
-        end_pos = QCursor.pos()
-        end_geom = QRect(end_pos.x(), end_pos.y(), 1, 1)
-        start_geom = self.geometry()
-        self.animation.setDuration(200)
-        self.animation.setStartValue(start_geom)
-        self.animation.setEndValue(end_geom)
-        self.animation.setEasingCurve(QEasingCurve.InQuad)
-        self.animation.finished.connect(self._handle_close_animation_finished)
-        self.animation.start()
-    def _handle_close_animation_finished(self):
-        ImagePreviewDialog.is_showing = False
-        self.accept()
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key_Escape:
-            self.close_with_animation()
-        else:
-            super().keyPressEvent(event)
-    def resizeEvent(self, event):
-        if self.label._current_scale == 1.0:
-            self.label.fitToWindow()
-        super().resizeEvent(event)
-
-# =================================================================
-# CLASE: PreviewListWidget
-# =================================================================
-class PreviewListWidget(QListWidget):
-    """
-    QListWidget personalizado:
-    1. Doble Clic -> Abre Vista Previa.
-    2. ESC -> Cierra Vista Previa activa.
-    3. Shift+Clic -> Selección múltiple lineal.
-    """
-    previewRequested = Signal(object)
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            item = self.itemAt(event.position().toPoint())
-            if item:
-                data = item.data(Qt.UserRole)
-                if data:
-                    self.previewRequested.emit(data)
-                    event.accept()
-                    return
-        super().mouseDoubleClickEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key_Escape:
-            from PySide6.QtWidgets import QApplication
-            for widget in QApplication.allWidgets():
-                if isinstance(widget, ImagePreviewDialog) and widget.isVisible():
-                    if hasattr(widget, 'close_with_animation'):
-                        widget.close_with_animation()
-                    else:
-                        widget.close()
-                    event.accept()
-                    return
-        super().keyPressEvent(event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier):
-            item_clicked = self.itemAt(event.position().toPoint())
-            current_anchor = self.currentItem()
-            if item_clicked and current_anchor:
-                start_row = self.row(current_anchor)
-                end_row = self.row(item_clicked)
-                low = min(start_row, end_row)
-                high = max(start_row, end_row)
-                if not (event.modifiers() & Qt.ControlModifier):
-                    self.clearSelection()
-                for i in range(low, high + 1):
-                    self.item(i).setSelected(True)
-                self.setCurrentItem(item_clicked)
-                return
-        super().mousePressEvent(event)
-
-# =================================================================
 # CLASE PARA MOSTRAR CARAS RECORTADAS (Sin cambios)
 # =================================================================
 class CircularFaceLabel(QLabel):
@@ -936,10 +865,11 @@ class CircularFaceLabel(QLabel):
         super().mousePressEvent(event)
 
 # =================================================================
-# CLASE: ZoomableClickableLabel (Sin cambios)
+# CLASE: ZoomableClickableLabel (Corregida)
 # =================================================================
 class ZoomableClickableLabel(QLabel):
     doubleClickedPath = Signal(str)
+
     def __init__(self, original_path=None, parent=None):
         super().__init__(parent)
         self.original_path = original_path
@@ -953,27 +883,51 @@ class ZoomableClickableLabel(QLabel):
         self._last_mouse_pos = QPoint()
         self.is_thumbnail_view = False
         self.setCursor(Qt.OpenHandCursor)
+
     def setOriginalPixmap(self, pixmap: QPixmap):
         if pixmap.isNull():
             self._original_pixmap = QPixmap()
         else:
             self._original_pixmap = pixmap
+
+        # Reseteamos variables
         self._current_scale = 1.0
         self._view_offset = QPointF(0.0, 0.0)
+
+        # ¡IMPORTANTE! Calcular el ajuste inicial inmediatamente
         self.fitToWindow()
+
     def fitToWindow(self):
+        """Ajusta la imagen para que quepa perfectamente en la ventana."""
         if self._original_pixmap.isNull():
-            self.setPixmap(QPixmap())
             return
-        scaled_pixmap = self._original_pixmap.scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        if self._original_pixmap.width() > 0:
-            self._current_scale = scaled_pixmap.width() / self._original_pixmap.width()
-        else:
-            self._current_scale = 1.0
+
+        # --- CORRECCIÓN: Obtener dimensiones reales disponibles ---
+        # Si el label aún no se ha "estirado" (ancho < 100), usamos el tamaño de la ventana padre.
+        # Esto soluciona que la foto salga minúscula al abrirse.
+        view_width = self.width()
+        view_height = self.height()
+
+        if view_width < 100 and self.window():
+            view_width = self.window().width()
+            view_height = self.window().height()
+
+        if view_width <= 0 or view_height <= 0: return
+
+        # Calculamos ratios usando esas dimensiones corregidas
+        x_ratio = view_width / self._original_pixmap.width()
+        y_ratio = view_height / self._original_pixmap.height()
+
+        # Ajustamos la escala para que ocupe el MÁXIMO posible (llenar pantalla)
+        self._current_scale = min(x_ratio, y_ratio)
+
+        # Centramos
+        self._view_offset = QPointF(0, 0)
+
+        # Aplicamos límites y actualizamos
         self._clamp_view_offset()
         self.update()
+
     def wheelEvent(self, event):
         if event.modifiers() == Qt.ControlModifier:
             if self.is_thumbnail_view:
@@ -983,9 +937,10 @@ class ZoomableClickableLabel(QLabel):
                     super().wheelEvent(event)
             else:
                 if event.angleDelta().y() > 0:
-                    parent_dialog = self.window()
-                    if isinstance(parent_dialog, ImagePreviewDialog):
-                        parent_dialog.close_with_animation()
+                    # Intentar cerrar si es el visor
+                    win = self.window()
+                    if win.property("is_lightbox"):
+                        win.close_with_animation()
             return
         if self.is_thumbnail_view:
             super().wheelEvent(event)
@@ -1008,79 +963,172 @@ class ZoomableClickableLabel(QLabel):
         )
         self._clamp_view_offset()
         self.update()
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.is_thumbnail_view:
+        # Si estamos en modo miniatura, el comportamiento es el estándar
+        if self.is_thumbnail_view:
+            super().mousePressEvent(event)
+            return
+
+        # --- LÓGICA DE DETECCIÓN DE CLIC EN ZONA NEGRA ---
+        if event.button() == Qt.LeftButton:
+            # 1. Calcular tamaño visual real de la imagen escalada
+            scaled_w = self._original_pixmap.width() * self._current_scale
+            scaled_h = self._original_pixmap.height() * self._current_scale
+
+            # 2. Calcular dónde empieza la imagen (centrado)
+            # Si la imagen es más pequeña que la ventana, hay margen (x > 0).
+            # Si es más grande, ocupa todo (x = 0).
+            x_start = (self.width() - scaled_w) / 2 if scaled_w < self.width() else 0
+            y_start = (self.height() - scaled_h) / 2 if scaled_h < self.height() else 0
+
+            # 3. Crear el rectángulo que ocupa la imagen REALMENTE en pantalla
+            # Usamos el ancho/alto visual o el de la ventana (el que sea menor) para definir el área clicable válida
+            valid_w = min(scaled_w, self.width())
+            valid_h = min(scaled_h, self.height())
+
+            # Ajuste: Si la imagen es gigante (zoom), el rect válido es toda la pantalla
+            img_rect = QRectF(x_start, y_start, scaled_w, scaled_h)
+
+            # 4. Comprobar si el clic está DENTRO de la imagen
+            if not img_rect.contains(event.position()):
+                # ¡CLIC EN LO NEGRO! -> Ignoramos el evento.
+                # Esto hará que Qt se lo pase automáticamente al padre (ImagePreviewDialog)
+                event.ignore()
+                return
+
+            # Si llegamos aquí, el clic fue DENTRO de la imagen -> Iniciamos Paneo (arrastrar)
             self._panning = True
             self._last_mouse_pos = event.position().toPoint()
             self.setCursor(Qt.ClosedHandCursor)
-        super().mousePressEvent(event)
+            event.accept() # Marcamos que hemos usado el evento
+
     def mouseMoveEvent(self, event):
         if self._panning and not self.is_thumbnail_view:
+            # Calculamos cuánto se ha movido el ratón
             delta = event.position().toPoint() - self._last_mouse_pos
-            self._view_offset -= QPointF(delta.x() / self._current_scale, delta.y() / self._current_scale)
             self._last_mouse_pos = event.position().toPoint()
+
+            # Ajustamos el offset inversamente al movimiento y ajustado a la escala
+            # (Si muevo ratón a la derecha, quiero ver la parte izquierda de la foto -> resto X)
+            self._view_offset.setX(self._view_offset.x() - (delta.x() / self._current_scale))
+            self._view_offset.setY(self._view_offset.y() - (delta.y() / self._current_scale))
+
             self._clamp_view_offset()
             self.update()
         else:
             super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and not self.is_thumbnail_view:
             self._panning = False
             self.setCursor(Qt.OpenHandCursor)
         super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event):
+        # Si es miniatura, emitimos la señal para abrir el visor
         if self.is_thumbnail_view and self.original_path:
             self.doubleClickedPath.emit(self.original_path)
+
+        # Si YA estamos en el visor (pantalla completa), el doble clic resetea el zoom
         if not self.is_thumbnail_view:
             self.fitToWindow()
+
         super().mouseDoubleClickEvent(event)
+
     def _clamp_view_offset(self):
-        if self._original_pixmap.isNull() or self._current_scale == 0: return
-        scaled_img_width = self._original_pixmap.width() * self._current_scale
-        scaled_img_height = self._original_pixmap.height() * self._current_scale
-        if scaled_img_width < self.width():
+        """Asegura que no 'nos salgamos' de la foto al arrastrar."""
+        if self._original_pixmap.isNull() or self._current_scale == 0:
+            return
+
+        # Ancho y alto de la "ventana" proyectada sobre la imagen original
+        viewport_width = self.width() / self._current_scale
+        viewport_height = self.height() / self._current_scale
+
+        img_width = self._original_pixmap.width()
+        img_height = self._original_pixmap.height()
+
+        # EJE X
+        if img_width <= viewport_width:
+            # Si la imagen cabe entera, centramos el offset (o lo dejamos a 0)
+            # En realidad, si cabe entera, el paintEvent se encarga de centrar el target.
+            # Aquí solo nos aseguramos de no tener offsets locos.
             self._view_offset.setX(0)
         else:
-            max_x_offset = self._original_pixmap.width() - (self.width() / self._current_scale)
-            self._view_offset.setX(max(0.0, min(self._view_offset.x(), max_x_offset)))
-        if scaled_img_height < self.height():
+            # Si la imagen es más grande, permitimos movernos hasta el borde
+            max_x = img_width - viewport_width
+            # Clamp: limitamos entre 0 y el máximo posible
+            new_x = max(0.0, min(self._view_offset.x(), max_x))
+            self._view_offset.setX(new_x)
+
+        # EJE Y (Misma lógica)
+        if img_height <= viewport_height:
             self._view_offset.setY(0)
         else:
-            max_y_offset = self._original_pixmap.height() - (self.height() / self._current_scale)
-            self._view_offset.setY(max(0.0, min(self._view_offset.y(), max_y_offset)))
+            max_y = img_height - viewport_height
+            new_y = max(0.0, min(self._view_offset.y(), max_y))
+            self._view_offset.setY(new_y)
+
     def paintEvent(self, event: QPaintEvent):
         if self.is_thumbnail_view:
             super().paintEvent(event)
             return
+
         if self._original_pixmap.isNull():
             return
+
         painter = QPainter(self)
+        # Usamos transformación bilineal/suave para que no se pixele al hacer zoom
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        scaled_width = self._original_pixmap.width() * self._current_scale
-        scaled_height = self._original_pixmap.height() * self._current_scale
-        target_x = 0.0
-        target_y = 0.0
-        if scaled_width < self.width():
-            target_x = (self.width() - scaled_width) / 2.0
-        if scaled_height < self.height():
-            target_y = (self.height() - scaled_height) / 2.0
-        target_rect = QRectF(target_x, target_y, scaled_width, scaled_height)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Dimensiones de la imagen escalada
+        scaled_w = self._original_pixmap.width() * self._current_scale
+        scaled_h = self._original_pixmap.height() * self._current_scale
+
+        # 1. Calcular TARGET (Dónde pintamos en la pantalla)
+        # Si la imagen es pequeña, la centramos. Si es grande, ocupamos toda la pantalla.
+        target_x = (self.width() - scaled_w) / 2.0 if scaled_w < self.width() else 0.0
+        target_y = (self.height() - scaled_h) / 2.0 if scaled_h < self.height() else 0.0
+
+        # El rectángulo destino es el mínimo entre el tamaño escalado y el tamaño del widget
+        target_w = min(scaled_w, float(self.width()))
+        target_h = min(scaled_h, float(self.height()))
+
+        target_rect = QRectF(target_x, target_y, target_w, target_h)
+
+        # 2. Calcular SOURCE (Qué trozo de la imagen original cogemos)
         src_x = self._view_offset.x()
         src_y = self._view_offset.y()
-        src_width = self.width() / self._current_scale
-        src_height = self.height() / self._current_scale
-        if scaled_width < self.width():
-            src_width = self._original_pixmap.width()
-        if scaled_height < self.height():
-            src_height = self._original_pixmap.height()
-        source_rect = QRectF(src_x, src_y, src_width, src_height)
+
+        # El ancho/alto origen es el ancho/alto destino "des-escalado"
+        src_w = target_w / self._current_scale
+        src_h = target_h / self._current_scale
+
+        source_rect = QRectF(src_x, src_y, src_w, src_h)
+
+        # 3. INTERSECCIÓN DE SEGURIDAD (Evita errores de redondeo en los bordes)
+        # Nos aseguramos de que no pedimos píxeles fuera de la imagen original
+        img_rect = QRectF(self._original_pixmap.rect())
+        source_rect = source_rect.intersected(img_rect)
+
         painter.drawPixmap(target_rect, self._original_pixmap, source_rect)
         painter.end()
+
     def resizeEvent(self, event):
+        # Si estamos en el visor grande
         if not self.is_thumbnail_view:
-            self.fitToWindow()
+            # Si la imagen es muy pequeña (acaba de arrancar), forzamos el ajuste
+            if self.width() < 100 or self._current_scale == 1.0:
+                self.fitToWindow()
+            else:
+                self._clamp_view_offset()
+                self.update()
         super().resizeEvent(event)
+
     def _open_preview(self):
+        # Importación local para evitar ciclos si ImagePreviewDialog está abajo
+        # (Aunque en este orden ya no hace falta, es buena práctica)
         if ImagePreviewDialog.is_showing:
             return
         if not self.original_path:
@@ -1090,6 +1138,194 @@ class ZoomableClickableLabel(QLabel):
             return
         preview_dialog = ImagePreviewDialog(full_pixmap, self)
         preview_dialog.show_with_animation()
+
+# =================================================================
+# CLASE: PreviewListWidget (Limpia)
+# =================================================================
+class PreviewListWidget(QListWidget):
+    """
+    QListWidget personalizado que auto-ajusta su altura para evitar huecos negros.
+    """
+    previewRequested = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Optimizaciones de rendimiento de renderizado
+        self.setUniformItemSizes(True)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setViewMode(QListWidget.IconMode)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item:
+                data = item.data(Qt.UserRole)
+                if data:
+                    self.previewRequested.emit(data)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Escape:
+            from PySide6.QtWidgets import QApplication
+            for widget in QApplication.allWidgets():
+                # Comprobamos por nombre de clase para evitar import circular
+                if widget.__class__.__name__ == "ImagePreviewDialog" and widget.isVisible():
+                    if hasattr(widget, 'close_with_animation'):
+                        widget.close_with_animation()
+                    else:
+                        widget.close()
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.ShiftModifier):
+            item_clicked = self.itemAt(event.position().toPoint())
+            current_anchor = self.currentItem()
+            if item_clicked and current_anchor:
+                start_row = self.row(current_anchor)
+                end_row = self.row(item_clicked)
+                low = min(start_row, end_row)
+                high = max(start_row, end_row)
+                if not (event.modifiers() & Qt.ControlModifier):
+                    self.clearSelection()
+                for i in range(low, high + 1):
+                    self.item(i).setSelected(True)
+                self.setCurrentItem(item_clicked)
+                return
+        super().mousePressEvent(event)
+
+    # --- MÉTODO MÁGICO NUEVO: Auto-ajuste de altura ---
+    def resizeEvent(self, event):
+        """
+        Cada vez que cambia el ancho (ej. abrir panel lateral),
+        recalculamos la altura exacta para eliminar huecos negros.
+        """
+        super().resizeEvent(event)
+
+        # Necesitamos saber el tamaño de la celda (configurado con setGridSize)
+        grid_size = self.gridSize()
+        if grid_size.isEmpty(): return
+
+        count = self.count()
+        if count == 0: return
+
+        # Ancho disponible dentro del widget
+        width = self.viewport().width()
+        if width <= 0: return
+
+        # Cálculos matemáticos
+        cell_w = grid_size.width()
+        cell_h = grid_size.height()
+
+        # Cuántas columnas caben realmente ahora
+        cols = max(1, width // cell_w)
+
+        # Cuántas filas necesito
+        rows = (count + cols - 1) // cols
+
+        # Altura ideal + pequeño margen
+        new_height = (rows * cell_h) + 10
+
+        # Aplicar solo si ha cambiado para evitar bucles infinitos
+        if self.height() != new_height:
+            self.setFixedHeight(new_height)
+
+# =================================================================
+# CLASE PARA VISTA PREVIA CON ZOOM (ImagePreviewDialog)
+# =================================================================
+class ImagePreviewDialog(QDialog):
+    is_showing = False
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        ImagePreviewDialog.is_showing = True
+
+        # Identificador para que el Label sepa que es un visor
+        self.setProperty("is_lightbox", True)
+
+        # Estilo Pantalla Completa y Fondo Transparente
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 230);") # Fondo oscuro
+
+        self._pixmap = pixmap
+
+        self.label = ZoomableClickableLabel(parent=self)
+        self.label.is_thumbnail_view = False
+        self.label.setStyleSheet("background-color: transparent;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.label)
+
+        self.animation = QPropertyAnimation(self, b"geometry")
+
+    def show_with_animation(self):
+        screen = QApplication.screenAt(QCursor.pos())
+        if not screen:
+            screen = QApplication.primaryScreen()
+        screen_geom = screen.availableGeometry()
+
+        self.setGeometry(screen_geom)
+        self.label.setOriginalPixmap(self._pixmap)
+
+        # Animación de apertura
+        start_rect = QRect(screen_geom.center().x(), screen_geom.center().y(), 0, 0)
+        end_rect = screen_geom
+
+        self.animation.setDuration(200)
+        self.animation.setStartValue(start_rect)
+        self.animation.setEndValue(end_rect)
+        self.animation.setEasingCurve(QEasingCurve.OutQuad)
+        self.animation.start()
+
+        self.show()
+
+    def close_with_animation(self):
+        end_pos = QCursor.pos()
+        end_geom = QRect(end_pos.x(), end_pos.y(), 1, 1)
+        start_geom = self.geometry()
+
+        self.animation.setDuration(200)
+        self.animation.setStartValue(start_geom)
+        self.animation.setEndValue(end_geom)
+        self.animation.setEasingCurve(QEasingCurve.InQuad)
+        self.animation.finished.connect(self._handle_close_animation_finished)
+        self.animation.start()
+
+    def _handle_close_animation_finished(self):
+        ImagePreviewDialog.is_showing = False
+        self.accept()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Escape:
+            self.close_with_animation()
+        else:
+            super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        if self.label._current_scale == 1.0:
+            self.label.fitToWindow()
+        super().resizeEvent(event)
+
+    def changeEvent(self, event):
+        """Detecta si la ventana pierde el foco (clic fuera de la app)."""
+        if event.type() == QEvent.ActivationChange:
+            # Si la ventana deja de ser la activa, cerramos
+            if not self.isActiveWindow():
+                self.close_with_animation()
+        super().changeEvent(event)
+
+    def mousePressEvent(self, event):
+        """
+        Este evento se activa si el usuario hace clic en el fondo (zona negra),
+        porque ZoomableClickableLabel habrá ignorado el evento.
+        """
+        if event.button() == Qt.LeftButton:
+            self.close_with_animation()
 
 # -----------------------------------------------------------------
 # CLASE MODIFICADA: PhotoDetailDialog (¡CON SOPORTE RAW!)
@@ -1155,6 +1391,20 @@ class PhotoDetailDialog(QDialog):
         self.resize(1000, 800)
 
         self._setup_ui()
+        style_sheet = """
+            QTreeWidget::item:selected {
+                background-color: #3daee9;
+                color: white;
+            }
+            QTreeWidget::item:selected:!active {
+                background-color: #3daee9; /* Mismo color aunque pierda el foco */
+                color: white;
+            }
+        """
+        self.date_tree_widget.setStyleSheet(style_sheet)
+        self.video_date_tree_widget.setStyleSheet(style_sheet)
+        self.cloud_date_tree.setStyleSheet(style_sheet) # <--- NUEVO
+
         self._load_photo()
         self._load_current_date() # Renombrado de _load_metadata
 
@@ -1185,9 +1435,14 @@ class PhotoDetailDialog(QDialog):
         """Carga solo la fecha actual de la BD o del archivo."""
         current_year, current_month = self.db.get_photo_date(self.original_path)
 
-        # Si no está en BD, usar la función simple de metadata_reader
+        # Si no está en BD...
         if current_year is None or current_month is None:
-            current_year, current_month = metadata_reader.get_photo_date(self.original_path)
+            # 1. Intentar por nombre primero
+            current_year, current_month = parse_date_from_filename(self.original_path)
+
+            # 2. Si falla, usar metadatos
+            if not current_year:
+                current_year, current_month = metadata_reader.get_photo_date(self.original_path)
 
         self.year_edit.setText(current_year or "Sin Fecha")
         month_index = self.month_combo.findData(current_month or "00")
@@ -1493,7 +1748,13 @@ class PhotoFinderWorker(QObject):
                     year, month = db_dates[path]
                 else:
                     self.progress.emit(f"Procesando nueva foto: {Path(path).name}")
-                    year, month = get_photo_date(path)
+                    year, month = parse_date_from_filename(path)
+
+                    # Si no se encontró fecha en el nombre, usamos metadatos internos (EXIF)
+                    if not year:
+                        year, month = get_photo_date(path)
+                    # ---------------------------------------------------
+
                     photos_to_upsert_in_db.append((path, year, month))
 
                 if year not in photos_by_year_month:
@@ -1562,8 +1823,11 @@ class VideoFinderWorker(QObject):
                     year, month = db_dates[path]
                 else:
                     self.progress.emit(f"Procesando nuevo vídeo: {Path(path).name}")
-                    year, month = get_video_date(path)
-                    videos_to_upsert_in_db.append((path, year, month))
+                    year, month = parse_date_from_filename(path)
+
+                    # Si no hay fecha en nombre, buscar metadatos internos
+                    if not year:
+                        year, month = get_video_date(path)
 
                 if year not in videos_by_year_month:
                     videos_by_year_month[year] = {}
@@ -1791,7 +2055,7 @@ class HelpDialog(QDialog):
 
         <h3>📖 Guía Rápida</h3>
         <p><b>📷 Fotos / 🎥 Vídeos:</b> Navega por tus recuerdos organizados por fecha.
-        Haz <b>doble clic</b> para ver en detalle. Usa <b>Ctrl+Rueda</b> para zoom.</p>
+        Haz <b>doble clic</b> para ver en detalle. Usa <b>Rueda</b> para zoom.</p>
 
         <p><b>👥 Personas:</b> La IA agrupa caras automáticamente.
         Entra en esta pestaña para etiquetar a tus amigos y familiares.</p>
@@ -2472,7 +2736,7 @@ class VisageVaultApp(QMainWindow):
         self.photo_list_widget_items = {}
 
 
-        # --- Variables de Vídeos (NUEVO) ---
+        # --- Variables de Vídeos ---
         self.videos_by_year_month = {}
         self.video_thread = None
         self.video_worker = None
@@ -2497,6 +2761,10 @@ class VisageVaultApp(QMainWindow):
         self.is_drive_connected = False
         self.active_folder_threads = []
         self.current_drive_folder_name = "Inicio"
+
+        # --- Variables para filtrado local ---
+        self.current_photo_filter_path = None
+        self.current_video_filter_path = None
 
         # --- Hilos y Señales ---
         self.threadpool = QThreadPool()
@@ -2558,63 +2826,62 @@ class VisageVaultApp(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # Panel Izquierdo (Fotos)
+        # --- NUEVO: Panel Izquierdo (Árbol de Carpetas Local) ---
+        self.photo_folder_panel = QWidget()
+        self.photo_folder_panel.setMinimumWidth(200)
+        photo_folder_layout = QVBoxLayout(self.photo_folder_panel)
+        photo_folder_layout.setContentsMargins(0, 0, 0, 0)
+
+        lbl_folder_photo = QLabel("Directorios:")
+        lbl_folder_photo.setStyleSheet("font-weight: bold; color: #3daee9; padding: 5px;")
+        photo_folder_layout.addWidget(lbl_folder_photo)
+
+        self.photo_folder_tree = QTreeWidget()
+        self.photo_folder_tree.setHeaderHidden(True)
+        self.photo_folder_tree.itemExpanded.connect(self._on_local_folder_tree_expanded)
+        self.photo_folder_tree.itemClicked.connect(self._on_photo_folder_tree_clicked)
+        photo_folder_layout.addWidget(self.photo_folder_tree)
+
+        self.main_splitter.addWidget(self.photo_folder_panel)
+        self.photo_folder_panel.hide() # Oculto por defecto
+        # ------------------------------------------------------
+
+        # Panel Central (Fotos) - ANTES ERA IZQUIERDO
         photo_area_widget = QWidget()
         self.photo_container_layout = QVBoxLayout(photo_area_widget)
-        self.photo_container_layout.setSpacing(0) # Sin espacio entre widgets
+        self.photo_container_layout.setSpacing(0)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(photo_area_widget)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._debounced_thumbnail_load)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_photo_scroll_changed)
         self.main_splitter.addWidget(self.scroll_area)
 
         # Panel Derecho (Navegación de Fotos)
         photo_right_panel_widget = QWidget()
         photo_right_panel_layout = QVBoxLayout(photo_right_panel_widget)
 
-        # --- Controles superiores con el nuevo botón ---
+        # Controles superiores
         top_controls = QVBoxLayout()
-
-        # Fila de botones
-        btn_row = QHBoxLayout()
-
-        self.select_dir_button = QPushButton("Cambiar Directorio")
-        self.select_dir_button.clicked.connect(self._open_directory_dialog)
-        btn_row.addWidget(self.select_dir_button)
-
-        # >>> BOTÓN NUEVO <<<
-        self.btn_duplicates = QPushButton("Buscar Duplicados")
-        self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        self.btn_duplicates.clicked.connect(self._start_duplicate_search) # Conectamos a la función
-        btn_row.addWidget(self.btn_duplicates)
-
-        top_controls.addLayout(btn_row)
-
-        self.path_label = QLabel("Ruta: No configurada")
-        self.path_label.setWordWrap(True)
-        top_controls.addWidget(self.path_label)
-
-        # Controles superiores (Botones y Path)
-        top_controls = QVBoxLayout()
-
-        # --- NUEVO: Layout horizontal para botones ---
         botones_layout = QHBoxLayout()
 
-        # Botón 1: Cambiar Directorio
         self.select_dir_button = QPushButton("Cambiar Directorio")
         self.select_dir_button.clicked.connect(self._open_directory_dialog)
         botones_layout.addWidget(self.select_dir_button)
 
-        # Botón 2: Buscar Duplicados (NUEVO)
         self.btn_duplicates = QPushButton("Buscar Duplicados")
-        # Usamos un icono de lupa o recarga estándar de Qt
         self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.btn_duplicates.clicked.connect(self._start_duplicate_search)
         botones_layout.addWidget(self.btn_duplicates)
 
-        # Añadimos la fila de botones al panel
         top_controls.addLayout(botones_layout)
-        # ---------------------------------------------
+
+        # --- NUEVO: Botón Ver Árbol ---
+        self.btn_show_photo_tree = QPushButton("Ver árbol de directorios")
+        self.btn_show_photo_tree.setCheckable(True)
+        self.btn_show_photo_tree.clicked.connect(self._toggle_photo_folder_tree)
+        top_controls.addWidget(self.btn_show_photo_tree)
+        # ------------------------------
 
         self.path_label = QLabel("Ruta: No configurada")
         self.path_label.setWordWrap(True)
@@ -2628,14 +2895,14 @@ class VisageVaultApp(QMainWindow):
         self.date_tree_widget.currentItemChanged.connect(self._scroll_to_item)
         photo_right_panel_layout.addWidget(self.date_tree_widget)
 
-        # self.status_label = QLabel("Estado: Inicializando...")
-        # photo_right_panel_layout.addWidget(self.status_label)
         self.main_splitter.addWidget(photo_right_panel_widget)
-
         fotos_layout.addWidget(self.main_splitter)
 
+        # Ajustar tamaños iniciales (Árbol oculto (0), Fotos, Panel Derecho)
+        self.main_splitter.setSizes([0, 800, 200])
+
         # ==========================================================
-        # 3. Pestaña "Vídeos" - ¡NUEVA!
+        # 3. Pestaña "Vídeos"
         # ==========================================================
         videos_tab_widget = QWidget()
         videos_layout = QVBoxLayout(videos_tab_widget)
@@ -2643,21 +2910,50 @@ class VisageVaultApp(QMainWindow):
 
         self.video_splitter = QSplitter(Qt.Horizontal)
 
-        # Panel Izquierdo (Vídeos)
+        # --- NUEVO: Panel Izquierdo (Árbol de Carpetas Local Vídeos) ---
+        self.video_folder_panel = QWidget()
+        self.video_folder_panel.setMinimumWidth(200)
+        video_folder_layout = QVBoxLayout(self.video_folder_panel)
+        video_folder_layout.setContentsMargins(0, 0, 0, 0)
+
+        lbl_folder_video = QLabel("Directorios:")
+        lbl_folder_video.setStyleSheet("font-weight: bold; color: #3daee9; padding: 5px;")
+        video_folder_layout.addWidget(lbl_folder_video)
+
+        self.video_folder_tree = QTreeWidget()
+        self.video_folder_tree.setHeaderHidden(True)
+        self.video_folder_tree.itemExpanded.connect(self._on_local_folder_tree_expanded)
+        self.video_folder_tree.itemClicked.connect(self._on_video_folder_tree_clicked)
+        video_folder_layout.addWidget(self.video_folder_tree)
+
+        self.video_splitter.addWidget(self.video_folder_panel)
+        self.video_folder_panel.hide()
+        # -------------------------------------------------------------
+
+        # Panel Central (Vídeos)
         video_area_widget = QWidget()
         self.video_container_layout = QVBoxLayout(video_area_widget)
-        self.video_container_layout.setSpacing(0) # Sin espacio entre widgets
+        self.video_container_layout.setSpacing(0)
         self.video_scroll_area = QScrollArea()
         self.video_scroll_area.setWidgetResizable(True)
         self.video_scroll_area.setWidget(video_area_widget)
         self.video_scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_video_thumbnails)
+        self.video_scroll_area.verticalScrollBar().valueChanged.connect(self._on_video_scroll_changed)
         self.video_splitter.addWidget(self.video_scroll_area)
 
         # Panel Derecho (Navegación de Vídeos)
         video_right_panel_widget = QWidget()
         video_right_panel_layout = QVBoxLayout(video_right_panel_widget)
 
-        # (No necesitamos el botón de cambiar directorio aquí, solo el árbol)
+        # --- NUEVO: Botonera superior para Vídeos ---
+        video_top_controls = QVBoxLayout()
+        self.btn_show_video_tree = QPushButton("Ver árbol de directorios")
+        self.btn_show_video_tree.setCheckable(True)
+        self.btn_show_video_tree.clicked.connect(self._toggle_video_folder_tree)
+        video_top_controls.addWidget(self.btn_show_video_tree)
+        video_right_panel_layout.addLayout(video_top_controls)
+        # --------------------------------------------
+
         video_year_label = QLabel("Navegación por Fecha (Vídeos):")
         video_right_panel_layout.addWidget(video_year_label)
         self.video_date_tree_widget = QTreeWidget()
@@ -2665,12 +2961,13 @@ class VisageVaultApp(QMainWindow):
         self.video_date_tree_widget.currentItemChanged.connect(self._scroll_to_video_item)
         video_right_panel_layout.addWidget(self.video_date_tree_widget)
 
-        # Añadir un spacer para llenar
         video_right_panel_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
 
         self.video_splitter.addWidget(video_right_panel_widget)
-
         videos_layout.addWidget(self.video_splitter)
+
+        # Ajustar tamaños iniciales
+        self.video_splitter.setSizes([0, 800, 200])
 
 
         # ==========================================================
@@ -2847,6 +3144,7 @@ class VisageVaultApp(QMainWindow):
 
         # Conectamos el scroll para cargar miniaturas bajo demanda (Lazy Loading)
         self.cloud_scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_cloud_thumbnails)
+        self.cloud_scroll_area.verticalScrollBar().valueChanged.connect(self._on_cloud_scroll_changed)
 
         self.cloud_splitter.addWidget(self.cloud_scroll_area)
 
@@ -2927,19 +3225,30 @@ class VisageVaultApp(QMainWindow):
             self._open_directory_dialog(force_select=True)
 
     def _open_directory_dialog(self, force_select=False):
-        """Abre el diálogo para seleccionar el directorio."""
-        dialog_title = "Selecciona la Carpeta Raíz de Fotos"
-        directory = QFileDialog.getExistingDirectory(self, dialog_title, os.path.expanduser("~"))
-
+        # ... (código existente hasta self.current_directory = directory) ...
         if directory:
             self.current_directory = directory
             config_manager.set_photo_directory(directory)
             self.path_label.setText(f"Ruta: {Path(directory).name}")
+
+            # --- NUEVO: Resetear filtros y recargar árboles si están abiertos ---
+            self.current_photo_filter_path = None
+            self.current_video_filter_path = None
+
+            if self.btn_show_photo_tree.isChecked():
+                self._load_local_tree_root(self.photo_folder_tree, directory)
+            else:
+                self.photo_folder_tree.clear()
+
+            if self.btn_show_video_tree.isChecked():
+                self._load_local_tree_root(self.video_folder_tree, directory)
+            else:
+                self.video_folder_tree.clear()
+            # ------------------------------------------------------------------
+
             self.date_tree_widget.clear()
-            self.video_date_tree_widget.clear() # <-- NUEVO
-            # --- MODIFICADO: Iniciar ambos escaneos ---
+            self.video_date_tree_widget.clear()
             self._start_media_scan(directory)
-            # --- FIN DE MODIFICACIÓN ---
         elif force_select:
              self._set_status("¡Debes seleccionar un directorio para comenzar!")
 
@@ -3100,7 +3409,19 @@ class VisageVaultApp(QMainWindow):
                 all_photos = self.photos_by_year_month[year][month]
 
                 # --- PASO 2: FILTRAR FOTOS VISIBLES ---
-                visible_photos = [p for p in all_photos if p not in hidden_paths]
+                # Modificado para incluir filtro de carpeta
+                visible_photos = []
+                for p in all_photos:
+                    if p in hidden_paths: continue
+
+                    # Filtro de carpeta (Si está activo)
+                    if self.current_photo_filter_path:
+                        # startswith funciona, pero os.path.commonpath es más seguro para rutas
+                        # Simple: comprobar si el path empieza por la carpeta filtro
+                        if not p.startswith(self.current_photo_filter_path):
+                            continue
+
+                    visible_photos.append(p)
 
                 # Si no hay fotos visibles en este mes, saltamos al siguiente
                 if not visible_photos:
@@ -3223,7 +3544,17 @@ class VisageVaultApp(QMainWindow):
                 all_videos = self.videos_by_year_month[year][month]
 
                 # --- PASO 2: FILTRAR VÍDEOS VISIBLES ---
-                visible_videos = [v for v in all_videos if v not in hidden_paths]
+                # Modificado para incluir filtro de carpeta
+                visible_videos = []
+                for v in all_videos:
+                    if v in hidden_paths: continue
+
+                    # Filtro de carpeta
+                    if self.current_video_filter_path:
+                        if not v.startswith(self.current_video_filter_path):
+                            continue
+
+                    visible_videos.append(v)
 
                 if not visible_videos:
                     continue
@@ -3821,6 +4152,136 @@ class VisageVaultApp(QMainWindow):
                         del struct[year]
                     return
 
+    # ------------------------------------------------------------------
+    # NUEVA LÓGICA DE SINCRONIZACIÓN SCROLL -> ÁRBOL
+    # ------------------------------------------------------------------
+
+    def _on_photo_scroll_changed(self):
+        """Sincroniza el árbol de fechas de fotos al hacer scroll."""
+        self._sync_tree_from_scroll(
+            self.scroll_area,
+            self.photo_group_widgets,
+            self.date_tree_widget
+        )
+
+    def _on_video_scroll_changed(self):
+        """Sincroniza el árbol de fechas de vídeos al hacer scroll."""
+        self._sync_tree_from_scroll(
+            self.video_scroll_area,
+            self.video_group_widgets,
+            self.video_date_tree_widget
+        )
+
+    def _on_cloud_scroll_changed(self):
+        """Sincroniza el árbol de fechas de la Nube al hacer scroll."""
+        self._sync_tree_from_scroll(
+            self.cloud_scroll_area,
+            self.cloud_group_widgets,
+            self.cloud_date_tree
+        )
+
+    def _sync_tree_from_scroll(self, scroll_area, group_widgets_dict, tree_widget):
+        """
+        Calcula qué etiqueta (Año/Mes) está visible en la parte superior
+        y selecciona el item correspondiente en el árbol.
+        """
+        if not group_widgets_dict: return
+
+        # Obtenemos la posición vertical actual del scroll
+        viewport_top = scroll_area.verticalScrollBar().value()
+
+        best_key = None
+        best_y = -1
+
+        # Buscamos el widget (etiqueta de año o mes) que esté más abajo
+        # pero que aún esté por encima (o rozando) la línea superior de la vista.
+        # Le damos un margen de 50px para que la selección cambie justo cuando el título llega arriba.
+
+        container_widget = scroll_area.widget()
+        if not container_widget: return
+
+        # Iteramos sobre los widgets registrados (etiquetas de texto Año/Mes)
+        for key, widget in group_widgets_dict.items():
+            try:
+                if not widget.isVisible(): continue
+
+                # Posición Y del widget dentro del área total
+                y = widget.y()
+
+                # Si el widget está por encima de mi vista actual (+ margen)
+                if y <= viewport_top + 80:
+                    # Me quedo con el que tenga la Y más alta (el que está más cerca de mi vista actual)
+                    if y > best_y:
+                        best_y = y
+                        best_key = key
+            except RuntimeError:
+                pass # El widget pudo haber sido borrado
+
+        if best_key:
+            # Ahora buscamos ese item en el árbol para seleccionarlo
+            # Las claves son "YYYY" o "YYYY-MM"
+            self._select_tree_item_by_key(tree_widget, best_key)
+
+    def _select_tree_item_by_key(self, tree_widget, key):
+        """Selecciona un item en el árbol de forma inteligente (soporta Texto y Tuplas)."""
+        tree_widget.blockSignals(True)
+
+        try:
+            # Descomponemos la clave (Ej: "2023-05")
+            parts = key.split('-')
+            year = parts[0]
+            month = parts[1] if len(parts) > 1 else None
+
+            # 1. Buscar el AÑO (Primer nivel)
+            year_item = None
+            for i in range(tree_widget.topLevelItemCount()):
+                item = tree_widget.topLevelItem(i)
+                # Comparamos como string por seguridad
+                if str(item.text(0)) == str(year):
+                    year_item = item
+                    break
+
+            target_item = None
+
+            if year_item:
+                if month:
+                    # 2. Buscar el MES (Hijo)
+                    # Aquí está la mejora: comprobamos el dato de forma flexible
+                    for i in range(year_item.childCount()):
+                        child = year_item.child(i)
+                        data = child.data(0, Qt.UserRole)
+
+                        is_match = False
+
+                        # CASO A: El dato es una Tupla o Lista ['2023', '05'] (Fotos/Videos/Nube nueva)
+                        if isinstance(data, (list, tuple)) and len(data) > 1:
+                            if str(data[1]) == str(month):
+                                is_match = True
+
+                        # CASO B: El dato es Texto "2023-05" (Nube antigua)
+                        elif isinstance(data, str):
+                            # Comprobamos si termina en "-05" o es igual a "05"
+                            if data == month or data.endswith(f"-{month}"):
+                                is_match = True
+
+                        if is_match:
+                            target_item = child
+                            break
+
+                    # Si buscábamos un mes y no lo encontramos, nos quedamos en el año
+                    if not target_item:
+                        target_item = year_item
+                else:
+                    # Si la clave solo era el año
+                    target_item = year_item
+
+            if target_item:
+                tree_widget.setCurrentItem(target_item)
+                tree_widget.scrollToItem(target_item)
+
+        finally:
+            tree_widget.blockSignals(False)
+
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_item(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
         """Desplazarse al grupo de FOTOS. Versión blindada contra errores C++."""
@@ -4275,40 +4736,59 @@ class VisageVaultApp(QMainWindow):
         config_manager.save_config(config_data)
 
     def _load_photo_splitter_state(self):
-        """Carga las posiciones del splitter de FOTOS desde la configuración."""
+        """Carga posiciones y configura prioridades de estiramiento (Fotos)."""
+        # 1. Configurar prioridades: Centro (1) se estira, Lados (0) fijos.
+        self.main_splitter.setStretchFactor(0, 0) # Árbol
+        self.main_splitter.setStretchFactor(1, 1) # Fotos (Prioridad)
+        self.main_splitter.setStretchFactor(2, 0) # Fechas
+
         config_data = config_manager.load_config()
         sizes = config_data.get('photo_splitter_sizes')
         min_right_width = 180
+
+        # Migración de config antigua
         if sizes and len(sizes) == 2:
-            if sizes[1] < min_right_width:
-                sizes[0] = sizes[0] + (sizes[1] - min_right_width)
-                sizes[1] = min_right_width
-            self.main_splitter.setSizes(sizes)
-        else:
-            default_width = self.width()
-            default_sizes = [int(default_width * 0.8), int(default_width * 0.2)]
-            if default_sizes[1] < min_right_width:
-                 default_sizes[1] = min_right_width
-                 default_sizes[0] = default_width - min_right_width
-            self.main_splitter.setSizes(default_sizes)
+            sizes.insert(0, 0)
+
+        if not sizes or len(sizes) != 3:
+            w = self.width()
+            sizes = [0, int(w * 0.8), int(w * 0.2)]
+
+        # Proteger ancho mínimo panel derecho
+        if sizes[2] < min_right_width:
+            diff = min_right_width - sizes[2]
+            sizes[2] = min_right_width
+            if sizes[1] > diff:
+                sizes[1] -= diff
+
+        self.main_splitter.setSizes(sizes)
 
     def _load_video_splitter_state(self):
-        """Carga las posiciones del splitter de VÍDEOS desde la configuración."""
+        """Carga posiciones y configura prioridades de estiramiento (Vídeos)."""
+        # 1. Configurar prioridades
+        self.video_splitter.setStretchFactor(0, 0)
+        self.video_splitter.setStretchFactor(1, 1) # Vídeos (Prioridad)
+        self.video_splitter.setStretchFactor(2, 0)
+
         config_data = config_manager.load_config()
         sizes = config_data.get('video_splitter_sizes')
         min_right_width = 180
+
+        # Migración
         if sizes and len(sizes) == 2:
-            if sizes[1] < min_right_width:
-                sizes[0] = sizes[0] + (sizes[1] - min_right_width)
-                sizes[1] = min_right_width
-            self.video_splitter.setSizes(sizes)
-        else:
-            default_width = self.width()
-            default_sizes = [int(default_width * 0.8), int(default_width * 0.2)]
-            if default_sizes[1] < min_right_width:
-                 default_sizes[1] = min_right_width
-                 default_sizes[0] = default_width - min_right_width
-            self.video_splitter.setSizes(default_sizes)
+            sizes.insert(0, 0)
+
+        if not sizes or len(sizes) != 3:
+            w = self.width()
+            sizes = [0, int(w * 0.8), int(w * 0.2)]
+
+        if sizes[2] < min_right_width:
+            diff = min_right_width - sizes[2]
+            sizes[2] = min_right_width
+            if sizes[1] > diff:
+                sizes[1] -= diff
+
+        self.video_splitter.setSizes(sizes)
 
     def resizeEvent(self, event):
         self.resize_timer.start()
@@ -4327,6 +4807,7 @@ class VisageVaultApp(QMainWindow):
         if self.videos_by_year_month:
             self._display_videos()
         self._reflow_faces()
+        # Ajustar geometría de la nube sin recargar las imágenes
 
     @Slot(str)
     def _open_photo_detail(self, original_path):
@@ -4396,7 +4877,7 @@ class VisageVaultApp(QMainWindow):
             preview_dialog.show_with_animation()
 
         except Exception as e:
-            print(f"Error al cargar vista previa (Ctrl+Rueda): {e}")
+            print(f"Error al cargar vista previa (Doble Clic): {e}")
 
     @Slot()
     def _handle_photo_date_changed(self, photo_path: str, new_year: str, new_month: str):
@@ -4586,37 +5067,54 @@ class VisageVaultApp(QMainWindow):
         self.current_face_count = start_index + len(face_list)
 
     def _load_existing_faces_async(self):
-        """Carga solo las caras nuevas que no estén ya visualizadas."""
+        """Carga caras nuevas Y limpia las que ya no deben estar (Sincronización)."""
         self.unknown_faces_group.setTitle("Caras Sin Asignar")
         self.cluster_faces_button.setEnabled(True)
         self.show_deleted_faces_button.setEnabled(True)
 
-        # 1. Obtener todas las caras candidatas de la BD
+        # 1. Obtener de la DB qué caras deberían estar realmente aquí
         all_unknown_faces = self.db.get_unknown_faces()
+        # Creamos un set de IDs válidos para búsqueda rápida
+        valid_db_ids = {f['id'] for f in all_unknown_faces}
 
-        # 2. Mapear qué IDs ya tenemos pintados en pantalla
-        existing_ids = set()
+        # 2. LIMPIEZA: Revisar qué hay en pantalla y borrar lo que sobra
+        # (Esto elimina las caras que acabas de borrar o las de la vista anterior)
+        existing_ids_on_ui = set()
         count_widgets = self.unknown_faces_layout.count()
 
-        for i in range(count_widgets):
+        # Iteramos hacia atrás para poder borrar sin romper el índice
+        for i in range(count_widgets - 1, -1, -1):
             item = self.unknown_faces_layout.itemAt(i)
             if item and item.widget():
-                # Solo nos interesan los widgets que son caras (CircularFaceLabel)
-                # Ignoramos QLabels de "No hay fotos" o "Cargando"
-                fid = item.widget().property("face_id")
+                widget = item.widget()
+
+                # ¿Es un widget de cara?
+                fid = widget.property("face_id")
+
                 if fid is not None:
-                    existing_ids.add(fid)
+                    # Si la cara en pantalla NO está en la lista válida de la DB
+                    if fid not in valid_db_ids:
+                        widget.hide()          # Ocultar visualmente ya
+                        widget.setParent(None) # Desvincular del layout
+                        widget.deleteLater()   # Borrar de memoria
+                    else:
+                        # Si es válida, la guardamos para no volver a cargarla
+                        existing_ids_on_ui.add(fid)
 
-        # 3. Filtrar: Quedarnos solo con las caras que NO están en pantalla
-        new_faces_to_add = [f for f in all_unknown_faces if f['id'] not in existing_ids]
+                # Limpiar mensajes antiguos de "No se han encontrado caras" si ahora hay datos
+                elif isinstance(widget, QLabel) and valid_db_ids and "No se han encontrado" in widget.text():
+                     widget.deleteLater()
 
-        # 4. Decidir si limpiamos o añadimos
-        # Si hay IDs existentes, es un APPEND. Si no, es una carga inicial (CLEAR).
-        is_append = (len(existing_ids) > 0)
+        # 3. AÑADIR: Cargar solo las que faltan
+        new_faces_to_add = [f for f in all_unknown_faces if f['id'] not in existing_ids_on_ui]
 
-        # Solo llamamos a populate si hay algo nuevo que añadir o si es una carga inicial vacía
-        if new_faces_to_add or not is_append:
-            self._populate_face_grid_async(new_faces_to_add, is_deleted_view=False, append=is_append)
+        # Si hay nuevas, las añadimos (append=True porque ya limpiamos nosotros)
+        if new_faces_to_add:
+            self._populate_face_grid_async(new_faces_to_add, is_deleted_view=False, append=True)
+
+        # Si la DB está vacía y la UI también, mostrar mensaje de vacío
+        elif not valid_db_ids and self.unknown_faces_layout.count() == 0:
+             self._populate_face_grid_async([], is_deleted_view=False, append=False)
 
     @Slot()
     def _on_face_clicked(self):
@@ -4670,9 +5168,17 @@ class VisageVaultApp(QMainWindow):
         menu.exec(pos)
 
     def _delete_face(self, face_id: int, widget: QWidget):
+        # 1. Borrar en DB
         self.db.soft_delete_face(face_id)
-        widget.deleteLater()
+
+        # 2. Borrar visualmente INMEDIATAMENTE
+        widget.hide()          # Ocultar
+        widget.setParent(None) # Sacar del layout
+        widget.deleteLater()   # Programar destrucción memoria
+
         self._set_status(f"Cara ID {face_id} eliminada.")
+
+        # 3. Recargar (ahora nuestra nueva función _load... no la volverá a pintar)
         self._load_existing_faces_async()
 
     def _restore_face(self, face_id: int, widget: QWidget):
@@ -4721,11 +5227,22 @@ class VisageVaultApp(QMainWindow):
     def _handle_face_found(self, face_id: int, photo_path: str, location_str: str):
         """
         Se llama cada vez que el escáner encuentra una cara nueva.
-        CORRECCIÓN: Usa fallback de ancho si la pestaña está oculta.
+        CORRECCIÓN: Filtra por la vista activa para no "ensuciar" la vista de Eliminadas.
         """
+        # 1. Filtro de Pestaña: Si no estamos en Personas, no hacer nada (ahorra CPU)
         if self.tab_widget.currentWidget() != self.personas_tab_widget:
-            # Si no estamos viendo la pestaña, no añadimos widget para ahorrar CPU.
-            # Se añadirá solo cuando entremos a la pestaña (gracias a _load_existing_faces_async).
+            return
+
+        # --- 2. NUEVO FILTRO DE VISTA ---
+        # Verificar qué opción del árbol está seleccionada.
+        # ID -1 = Caras Sin Asignar.
+        # ID -2 = Caras Eliminadas.
+        # ID >= 0 = Persona Específica.
+        current_item = self.people_tree_widget.currentItem()
+
+        # Si no hay selección o NO estamos en "Caras Sin Asignar", ignoramos el evento visual.
+        # La cara se guarda en la BD igualmente, y aparecerá cuando vuelvas a la sección correcta.
+        if not current_item or current_item.data(0, Qt.UserRole) != -1:
             return
 
         face_widget = CircularFaceLabel(QPixmap())
@@ -4739,11 +5256,10 @@ class VisageVaultApp(QMainWindow):
         face_widget.clicked.connect(self._on_face_clicked)
         face_widget.rightClicked.connect(self._on_face_right_clicked)
 
-        # --- CORRECCIÓN DE GEOMETRÍA ---
+        # Corrección de Geometría (fallback de ancho)
         viewport_width = self.face_scroll_area.viewport().width() - 30
         if viewport_width < 300:
              viewport_width = max(400, self.width() - 350)
-        # ------------------------------
 
         num_cols = max(1, viewport_width // 110)
 
@@ -4832,48 +5348,65 @@ class VisageVaultApp(QMainWindow):
             placeholder.setText("Error")
 
     def closeEvent(self, event):
-        """Limpia de forma segura todos los hilos antes de salir."""
+        """Limpia de forma segura y robusta todos los hilos antes de salir."""
         print("Cerrando aplicación... Por favor, espere.")
         self._set_status("Cerrando... limpiando recursos.")
 
+        # 1. Guardar configuración
         try:
             self._save_photo_splitter_state()
             self._save_video_splitter_state()
             config_manager.set_thumbnail_size(self.current_thumbnail_size)
         except Exception: pass
 
+        # 2. Parar vigilante
         if self.file_watcher:
             self.file_watcher.stop()
 
-        # 1. PARADA AGRESIVA DEL THREADPOOL GLOBAL (Miniaturas)
-        self.threadpool.clear() # Borra tareas pendientes
-        # No esperamos (waitForDone) si queremos salir rápido, o esperamos poco
+        # 3. Limpiar cola de miniaturas
+        self.threadpool.clear()
 
-        # 2. Detener workers de ESCANEO (Fotos/Videos)
+        # 4. DETENER WORKERS DE ESCANEO (FOTOS Y VÍDEOS)
+        # Corrección: Si no paran a tiempo, usamos terminate() para evitar el core dump.
         for thread, worker_name in [(self.photo_thread, 'photo_worker'), (self.video_thread, 'video_worker')]:
             if thread and thread.isRunning():
                 worker = getattr(self, worker_name, None)
                 if worker:
-                    worker.is_running = False
-                thread.quit()
-                thread.wait(500) # Espera corta
+                    worker.is_running = False # Señal suave
 
-        # 3. DETENER HILO DE CARAS (EL PROBLEMÁTICO)
+                thread.quit()
+
+                # Esperamos 1.5s a que cierre bien. Si no, forzamos.
+                if not thread.wait(1500):
+                    print(f"⚠️ {worker_name} tardando demasiado. Forzando detención...")
+                    thread.terminate() # Mata el hilo del sistema
+                    thread.wait()      # Asegura que está muerto antes de seguir
+
+        # 5. DETENER HILO DE CARAS (EL MÁS PESADO)
         if self.face_scan_thread and self.face_scan_thread.isRunning():
             print("Deteniendo escáner de caras...")
             if self.face_scan_worker:
-                # LLAMADA AL NUEVO MÉTODO DE APAGADO FORZOSO
+                # Parada lógica (cancela futuros de IA)
                 self.face_scan_worker.stop()
-
-                # Desconectar señales para evitar intentos de escritura en UI muerta
                 try: self.face_scan_worker.signals.scan_finished.disconnect()
                 except: pass
 
             self.face_scan_thread.quit()
-            # Esperamos un poco más para dejar que el ThreadPoolExecutor se limpie
+
+            # Esperamos 2s. Si Face Recognition está bloqueado en C++, no responderá al quit().
             if not self.face_scan_thread.wait(2000):
-                print("Forzando terminación del hilo de caras...")
-                self.face_scan_thread.terminate() # Último recurso si se cuelga
+                print("🛑 El motor de IA no responde. Matando proceso...")
+                self.face_scan_thread.terminate() # Obligatorio para evitar 'QThread Destroyed...'
+                self.face_scan_thread.wait()      # Confirmar muerte
+
+        # 6. CAJA FUERTE
+        if hasattr(self, 'safe_thread') and self.safe_thread and self.safe_thread.isRunning():
+             if hasattr(self, 'safe_worker'): self.safe_worker.is_running = False
+             self.safe_thread.quit()
+             self.safe_thread.wait(1000)
+
+        # 7. DRIVE
+        self._stop_cloud_operations()
 
         print("Limpieza finalizada. Adiós.")
         event.accept()
@@ -4895,7 +5428,6 @@ class VisageVaultApp(QMainWindow):
                 new_size = max(self.MIN_THUMB_SIZE, self.current_thumbnail_size - self.THUMB_SIZE_STEP)
 
             else:
-                # Si es otra tecla (ej: Ctrl+Rueda), dejar que el sistema la maneje
                 super().keyPressEvent(event)
                 return
 
@@ -5583,33 +6115,37 @@ class VisageVaultApp(QMainWindow):
 
                 # --- LISTA DE FOTOS ---
                 list_widget = PreviewListWidget()
+                # Configuración básica
                 list_widget.setMovement(QListWidget.Static)
                 list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-                list_widget.setSpacing(20)
-
-                # Menú contextual
-                list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-                list_widget.customContextMenuRequested.connect(
-                    lambda pos, lw=list_widget: self._on_drive_context_menu(pos, lw)
-                )
-
-                list_widget.setViewMode(QListWidget.IconMode)
-                list_widget.setResizeMode(QListWidget.Adjust)
+                list_widget.setSpacing(10)
                 list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setFrameShape(QFrame.NoFrame)
 
+                # Conexiones
+                list_widget.customContextMenuRequested.connect(
+                    lambda pos, lw=list_widget: self._on_drive_context_menu(pos, lw)
+                )
+                list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
                 list_widget.previewRequested.connect(self._on_drive_preview_requested)
 
-                # Usamos el tamaño configurado por el usuario
+                # --- CONFIGURACIÓN DE TAMAÑO ---
                 icon_size = self.current_thumbnail_size
-                list_widget.setIconSize(QSize(icon_size, icon_size))
-                item_dim = icon_size + 8
+                cell_size = icon_size + 10
 
+                list_widget.setIconSize(QSize(icon_size, icon_size))
+
+                # ¡VITAL! Esto es lo que lee el resizeEvent para calcular
+                list_widget.setGridSize(QSize(cell_size, cell_size))
+                # -------------------------------
+
+                item_dim = cell_size
+
+                # Añadir items
                 for f in photos:
                     item = QListWidgetItem("Cargando...")
                     item.setToolTip(f['name'])
-
                     safe_data = {
                         'id': str(f['id']),
                         'name': str(f['name']),
@@ -5620,17 +6156,24 @@ class VisageVaultApp(QMainWindow):
                     item.setData(Qt.UserRole, safe_data)
                     item.setData(Qt.UserRole + 1, "not_loaded")
                     item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+
+                    # Hint inicial (aunque resizeEvent lo corregirá)
                     item.setSizeHint(QSize(item_dim, item_dim))
+
                     list_widget.addItem(item)
 
-                # Cálculo de altura
-                viewport_width = self.cloud_scroll_area.viewport().width() - 30
-                thumb_total_width = item_dim + list_widget.spacing()
-                num_cols = max(1, viewport_width // thumb_total_width)
-                rows = (len(photos) + num_cols - 1) // num_cols
-                total_height = (rows * item_dim) + (rows * list_widget.spacing()) + 20
+                # --- ALTURA INICIAL APROXIMADA ---
+                # Le damos una altura inicial para que aparezca,
+                # pero inmediatamente después el resizeEvent la corregirá al milímetro.
+                viewport_width = self.cloud_scroll_area.viewport().width()
+                if viewport_width < 100: viewport_width = 800
 
-                list_widget.setFixedHeight(total_height)
+                num_cols = max(1, viewport_width // cell_size)
+                rows = (len(photos) + num_cols - 1) // num_cols
+                initial_height = (rows * cell_size) + 10
+
+                list_widget.setFixedHeight(initial_height)
+
                 widgets_to_add_for_year.append(list_widget)
 
             for w in widgets_to_add_for_year:
@@ -5658,18 +6201,28 @@ class VisageVaultApp(QMainWindow):
         if not current: return
 
         key = ""
+        user_data = current.data(0, Qt.UserRole)
+
         if current.parent(): # Es un mes
-            key = current.data(0, Qt.UserRole) # "2023-05"
-        else: # Es un año
-            key = current.text(0) # "2023"
+            # --- CORRECCIÓN ROBUSTA ---
+            # Si es una Tupla/Lista: ('2023', '05') -> Formato Nuevo
+            if isinstance(user_data, (list, tuple)) and len(user_data) >= 2:
+                year, month = user_data[0], user_data[1]
+                key = f"{year}-{month}"
+
+            # Si es Texto: "2023-05" -> Formato Antiguo o Caché
+            elif isinstance(user_data, str):
+                key = user_data
+            # --------------------------
+        else:
+            # Es un año
+            key = current.text(0)
 
         target_widget = self.cloud_group_widgets.get(key)
 
-        # Validar que el widget existe y es visible para evitar errores C++
         if target_widget:
             try:
                 self.cloud_scroll_area.ensureWidgetVisible(target_widget, 0, 0)
-                # Forzar carga de miniaturas en la nueva posición tras un breve retraso
                 QTimer.singleShot(200, self._load_visible_cloud_thumbnails)
             except RuntimeError:
                 pass
@@ -6471,11 +7024,193 @@ class VisageVaultApp(QMainWindow):
 
         QMessageBox.information(self, "Completado", "Los archivos se han movido a la caja fuerte correctamente.")
 
+    # ==========================================================
+    # LÓGICA DE ÁRBOLES DE DIRECTORIO LOCALES (FOTOS Y VÍDEOS)
+    # ==========================================================
+
+    @Slot()
+    def _toggle_photo_folder_tree(self):
+        """Muestra/Oculta el árbol de fotos con gestión precisa del espacio."""
+        # 1. Capturar tamaños ACTUALES antes de cambiar nada
+        current_sizes = self.main_splitter.sizes() # [Izq, Centro, Der]
+
+        should_show = self.btn_show_photo_tree.isChecked()
+        self.photo_folder_panel.setVisible(should_show)
+
+        if should_show:
+            # --- ABRIR ---
+            # Si estaba colapsado (ancho < 50), le damos 280px quitándoselos al centro.
+            if current_sizes[0] < 50:
+                target_width = 280
+                # Nuevo Centro = Centro Actual - Lo que ocupa el árbol
+                new_center = max(100, current_sizes[1] - target_width)
+
+                # [280, Resto, Derecha_Intacta]
+                self.main_splitter.setSizes([target_width, new_center, current_sizes[2]])
+
+            # Carga perezosa de datos
+            if self.photo_folder_tree.topLevelItemCount() == 0 and self.current_directory:
+                self._load_local_tree_root(self.photo_folder_tree, self.current_directory)
+        else:
+            # --- CERRAR ---
+            # Sumamos el ancho del árbol (current_sizes[0]) al centro.
+            # La derecha (current_sizes[2]) se queda IGUAL.
+            new_center = current_sizes[1] + current_sizes[0]
+            self.main_splitter.setSizes([0, new_center, current_sizes[2]])
+
+    @Slot()
+    def _toggle_video_folder_tree(self):
+        """Muestra/Oculta el árbol de vídeos con gestión precisa del espacio."""
+        current_sizes = self.video_splitter.sizes()
+
+        should_show = self.btn_show_video_tree.isChecked()
+        self.video_folder_panel.setVisible(should_show)
+
+        if should_show:
+            # --- ABRIR ---
+            if current_sizes[0] < 50:
+                target_width = 280
+                new_center = max(100, current_sizes[1] - target_width)
+                self.video_splitter.setSizes([target_width, new_center, current_sizes[2]])
+
+            if self.video_folder_tree.topLevelItemCount() == 0 and self.current_directory:
+                self._load_local_tree_root(self.video_folder_tree, self.current_directory)
+        else:
+            # --- CERRAR ---
+            new_center = current_sizes[1] + current_sizes[0]
+            self.video_splitter.setSizes([0, new_center, current_sizes[2]])
+
+    def _load_local_tree_root(self, tree_widget, root_path):
+        """Carga la raíz del árbol local."""
+        tree_widget.clear()
+        root_name = Path(root_path).name
+        root_item = QTreeWidgetItem(tree_widget, [root_name])
+        root_item.setData(0, Qt.UserRole, root_path)
+        root_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+        root_item.setExpanded(True)
+
+        # Cargar primer nivel de subcarpetas
+        self._populate_local_item(root_item, root_path)
+
+    def _populate_local_item(self, parent_item, folder_path):
+        """Busca subcarpetas y las añade al item."""
+        try:
+            # Listar directorios (no ocultos)
+            entries = []
+            with os.scandir(folder_path) as it:
+                for entry in it:
+                    if entry.is_dir() and not entry.name.startswith('.'):
+                        entries.append(entry)
+
+            # Ordenar alfabéticamente
+            entries.sort(key=lambda e: e.name.lower())
+
+            for entry in entries:
+                item = QTreeWidgetItem(parent_item, [entry.name])
+                item.setData(0, Qt.UserRole, entry.path)
+                item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+
+                # Chequeo rápido de si tiene hijos para añadir dummy (Lazy Load)
+                has_subdirs = False
+                try:
+                    with os.scandir(entry.path) as sub_it:
+                        for sub in sub_it:
+                            if sub.is_dir() and not sub.name.startswith('.'):
+                                has_subdirs = True
+                                break
+                except: pass
+
+                if has_subdirs:
+                    QTreeWidgetItem(item, ["Cargando..."])
+
+        except Exception as e:
+            print(f"Error leyendo carpeta {folder_path}: {e}")
+
+    @Slot(QTreeWidgetItem)
+    def _on_local_folder_tree_expanded(self, item):
+        """Carga perezosa al expandir."""
+        if item.childCount() == 1 and item.child(0).text(0) == "Cargando...":
+            item.removeChild(item.child(0)) # Quitar dummy
+            folder_path = item.data(0, Qt.UserRole)
+            if folder_path:
+                self._populate_local_item(item, folder_path)
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_photo_folder_tree_clicked(self, item, column):
+        path = item.data(0, Qt.UserRole)
+        if not path: return
+
+        # Si es la raíz, quitamos el filtro
+        if path == self.current_directory:
+            self.current_photo_filter_path = None
+            self._set_status(f"Mostrando todas las fotos de: {Path(path).name}")
+        else:
+            self.current_photo_filter_path = path
+            self._set_status(f"Filtrando fotos en: {Path(path).name}")
+
+        self._display_photos() # Redibujar con filtro
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_video_folder_tree_clicked(self, item, column):
+        path = item.data(0, Qt.UserRole)
+        if not path: return
+
+        if path == self.current_directory:
+            self.current_video_filter_path = None
+            self._set_status(f"Mostrando todos los vídeos de: {Path(path).name}")
+        else:
+            self.current_video_filter_path = path
+            self._set_status(f"Filtrando vídeos en: {Path(path).name}")
+
+        self._display_videos() # Redibujar con filtro
+
 def run_visagevault():
-    """Función para iniciar la aplicación gráfica."""
+    """Función para iniciar la aplicación con Splash Screen corregido (PySide6)."""
     app = QApplication(sys.argv)
+
+    # --- 1. INSTANCIAR LA APP PRIMERO ---
     window = VisageVaultApp()
-    window.showMaximized()
+
+    # --- 2. PREPARAR IMAGEN ---
+    splash_path = "AnabasaSoft.png"
+    if not os.path.exists(splash_path):
+        splash_path = resource_path("AnabasaSoft.png")
+
+    pixmap = QPixmap(splash_path)
+
+    if pixmap.isNull():
+        pixmap = QPixmap(resource_path("visagevault.png")).scaled(
+            600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+    # --- 3. CONFIGURAR SPLASH SCREEN (CORRECCIÓN) ---
+    # ERROR ANTERIOR: QSplashScreen(window, pixmap) -> No permitido en PySide6
+    # SOLUCIÓN: Instanciar solo con pixmap y asignar padre después.
+    splash = QSplashScreen(pixmap)
+
+    # Asignamos la ventana principal como padre explícitamente.
+    # Los flags son vitales:
+    # - Qt.Window: Para que sea una ventana flotante y no se incruste dentro de la app.
+    # - Qt.FramelessWindowHint: Para quitar los bordes.
+    # - Qt.WindowStaysOnTopHint: Para reforzar que esté encima.
+    splash.setParent(window, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+    # Bloqueo Modal: Impide clics en la ventana 'padre' (window)
+    splash.setWindowModality(Qt.ApplicationModal)
+
+    # --- 4. MOSTRAR EN ORDEN ---
+    window.showMaximized() # Mostramos la App
+    splash.show()          # Mostramos el Splash (al ser hijo, aparecerá encima)
+
+    app.processEvents()    # Asegurar renderizado inmediato
+
+    # --- 5. ESPERAR 2 SEGUNDOS ---
+    loop = QEventLoop()
+    QTimer.singleShot(2000, loop.quit)
+    loop.exec()
+
+    # --- 6. TERMINAR ---
+    splash.finish(window)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
