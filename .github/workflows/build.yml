@@ -45,6 +45,8 @@ jobs:
             --hidden-import sklearn \
             --hidden-import scipy._cyutility \
             --hidden-import sklearn._cyutility \
+            --hidden-import google_auth_oauthlib \
+            --hidden-import googleapiclient \
             visagevault.py
 
       - name: Upload Windows Asset
@@ -88,6 +90,8 @@ jobs:
             --hidden-import sklearn \
             --hidden-import scipy._cyutility \
             --hidden-import sklearn._cyutility \
+            --hidden-import google_auth_oauthlib \
+            --hidden-import googleapiclient \
             visagevault.py
 
       - name: Create DMG
@@ -155,6 +159,8 @@ jobs:
             --hidden-import sklearn \
             --hidden-import scipy._cyutility \
             --hidden-import sklearn._cyutility \
+            --hidden-import google_auth_oauthlib \
+            --hidden-import googleapiclient \
             visagevault.py
 
       - name: Prepare AppDir
