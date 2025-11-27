@@ -10,49 +10,39 @@ import datetime
 from pathlib import Path
 
 class VisageVaultDB:
-    # Modificar __init__ para aceptar 'db_path'
     def __init__(self, db_path=None, is_worker=False):
+        # --- 1. INICIALIZACIÓN SEGURA (Variables por defecto) ---
+        # Definimos esto PRIMERO para que existan aunque todo lo demás falle.
+        self.conn = None
+        self.meta_conn = None
+        self.was_reset = False  # <--- Esto arregla el AttributeError
+        self.is_worker = is_worker
 
-        # 1. Gestión de la ruta de la BD
+        # --- 2. CONFIGURACIÓN DE RUTA ---
         if db_path:
-            # Si nos pasan una ruta (desde AUR/Linux), la usamos
             self.db_path = db_path
         else:
-            # Si no (Windows/Dev), usamos la local junto al script
+            # Modo Dev/Windows
             base_dir = os.path.dirname(os.path.abspath(__file__))
             self.db_path = os.path.join(base_dir, "visagevault.db")
 
-        # Asegurar que el directorio existe (por seguridad)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-
-        self.is_worker = is_worker
-        self.conn = None
-
-        # 2. Intentar conectar a la BD Principal
+        # --- 3. CREACIÓN DE DIRECTORIOS ---
         try:
-            self._connect_main_db()
+            # Aseguramos que la carpeta donde va la DB existe (vital para ~/.local/share/...)
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Error crítico creando directorio de DB: {e}")
 
-            if not is_worker:
-                # CHEQUEO DE SALUD
-                if not self._check_integrity():
-                    raise sqlite3.DatabaseError("La base de datos está corrupta o es incompatible.")
-
-                # Si llegamos aquí, la BD está sana.
-                # Hacemos backup de los datos actuales a la MetaDB por seguridad
-                self._sync_main_to_meta()
-
-                self._create_tables()
-                self._check_migrations()
-
-        except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            if is_worker:
-                # Un worker no debe intentar arreglar la BD, solo fallar
-                print(f"Worker falló al conectar DB: {e}")
-                raise e
-
-            print(f"❌ ERROR CRÍTICO EN BD: {e}")
-            print("🔄 Iniciando protocolo de AUTOREPARACIÓN...")
-            self._perform_hard_reset()
+        # --- 4. CONEXIÓN ---
+        # Solo conectamos si todo lo anterior fue bien
+        if not self.is_worker:
+            try:
+                self._connect_main_db()
+                self._init_db()
+            except Exception as e:
+                print(f"Error inicializando DB: {e}")
 
     def _connect_main_db(self):
         """Conexión estándar con optimizaciones."""
