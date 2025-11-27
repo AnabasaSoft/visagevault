@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.6.9
+# VERSIÓN: 1.6.10
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -2731,7 +2731,6 @@ class VisageVaultApp(QMainWindow):
         self.file_watcher = None
 
         self.setMinimumSize(QSize(900, 600))
-        self.db = VisageVaultDB()
         self.current_directory = None
 
         # --- Configuración de Zoom de Miniaturas ---

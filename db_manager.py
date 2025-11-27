@@ -10,20 +10,23 @@ import datetime
 from pathlib import Path
 
 class VisageVaultDB:
-    def __init__(self, db_name="visagevault.db", is_worker=False):
-        """
-        Inicializa la conexión.
-        Si es el hilo principal (is_worker=False), realiza chequeos de integridad
-        y gestión de la base de datos de metadatos (MetaDB).
-        """
-        self.was_reset = False # Bandera para avisar a la UI
+    # Modificar __init__ para aceptar 'db_path'
+    def __init__(self, db_path=None, is_worker=False):
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.db_path = os.path.join(base_dir, db_name)
-        self.meta_db_path = os.path.join(base_dir, "visagevault_meta.db")
+        # 1. Gestión de la ruta de la BD
+        if db_path:
+            # Si nos pasan una ruta (desde AUR/Linux), la usamos
+            self.db_path = db_path
+        else:
+            # Si no (Windows/Dev), usamos la local junto al script
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(base_dir, "visagevault.db")
 
-        # 1. Inicializar siempre la MetaDB (Respaldo de datos valiosos)
-        self._init_meta_db()
+        # Asegurar que el directorio existe (por seguridad)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        self.is_worker = is_worker
+        self.conn = None
 
         # 2. Intentar conectar a la BD Principal
         try:
